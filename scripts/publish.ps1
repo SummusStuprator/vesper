@@ -149,6 +149,11 @@ if (Ok git rev-parse -q --verify "refs/tags/$tag") {
 }
 if (-not (Confirm-Step "Push tag ${tag}? This starts the Windows, macOS and Linux installer builds.")) { Say "Tag $tag exists locally but was not pushed." 'Yellow'; exit 0 }
 Run git push origin $tag | Out-Null
+# Create the draft release under your own account (the workflow only makes one if this did not),
+# so the release page shows you as its author rather than github-actions.
+if (-not (Ok gh release view $tag --repo "$owner/$Name")) {
+  Run gh release create $tag --repo "$owner/$Name" --draft --verify-tag --title "Vesper $version" --generate-notes | Out-Null
+}
 Say "Builds started: $url/actions" 'Green'
 
 if ($PublishRelease) {

@@ -18,10 +18,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Create the draft release (once)
+      - name: Create the draft release (only if publish.ps1 did not)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # publish.ps1 creates the draft under the maintainer's account right after pushing the tag;
+          # give it a moment so the release is authored by a person, not by this workflow.
+          for i in $(seq 1 12); do gh release view "$TAG" >/dev/null 2>&1 && break; sleep 5; done
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --draft --title "Vesper ${TAG#v}" --generate-notes
           fi
