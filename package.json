@@ -81,7 +81,8 @@
       "shortcutName": "Vesper",
       "installerIcon": "assets/icon.ico",
       "uninstallerIcon": "assets/icon.ico",
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "buildUniversalInstaller": false
     },
     "mac": {
       "target": [

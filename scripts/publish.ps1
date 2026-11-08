@@ -134,7 +134,7 @@ if (-not $remoteExists) {
   Ok gh repo edit "$owner/$Name" --add-topic coding-agent --add-topic ai-agent --add-topic electron --add-topic llm --add-topic refuseless | Out-Null
 } else {
   if (-not (Ok git remote get-url origin)) { Run git remote add origin "$url.git" | Out-Null }
-  if (-not (Confirm-Step "Push '$branch' to $url?")) { Say 'Stopped.' 'Yellow'; exit 0 }
+  if (-not (Confirm-Step "Push '$branch' to ${url}?")) { Say 'Stopped.' 'Yellow'; exit 0 }
   Run git push -u origin $branch | Out-Null
 }
 Say "Code is at $url" 'Green'
@@ -147,16 +147,18 @@ if (Ok git rev-parse -q --verify "refs/tags/$tag") {
 } else {
   Run git tag -a $tag -m "Vesper $version" | Out-Null
 }
-if (-not (Confirm-Step "Push tag $tag? This starts the Windows, macOS and Linux installer builds.")) { Say "Tag $tag exists locally but was not pushed." 'Yellow'; exit 0 }
+if (-not (Confirm-Step "Push tag ${tag}? This starts the Windows, macOS and Linux installer builds.")) { Say "Tag $tag exists locally but was not pushed." 'Yellow'; exit 0 }
 Run git push origin $tag | Out-Null
 Say "Builds started: $url/actions" 'Green'
 
 if ($PublishRelease) {
   Say 'Waiting for the builds (usually 10-20 minutes)...'
   $runId = $null
-  for ($i = 0; $i -lt 20 -and -not $runId; $i++) {
+  # Filter in PowerShell: Windows PowerShell 5.1 mangles embedded quotes in native arguments (e.g. a --jq filter).
+  for ($i = 0; $i -lt 40 -and -not $runId; $i++) {
     Start-Sleep -Seconds 6
-    $runId = (& gh run list --repo "$owner/$Name" --workflow release.yml --limit 1 --json databaseId,headBranch --jq ".[] | select(.headBranch==`"$tag`") | .databaseId" 2>$null | Select-Object -First 1)
+    $runs = (& gh run list --repo "$owner/$Name" --workflow release.yml --limit 10 --json databaseId,headBranch 2>$null) -join "`n"
+    if ($runs) { foreach ($r in @(ConvertFrom-Json $runs)) { if ($r.headBranch -eq $tag) { $runId = $r.databaseId; break } } }
   }
   if (-not $runId) { Say "Could not find the build. Publish the draft yourself at $url/releases" 'Yellow'; exit 0 }
   & gh run watch $runId --repo "$owner/$Name" --exit-status
