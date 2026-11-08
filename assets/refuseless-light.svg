@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 172 32" fill="none">
+  <g transform="translate(2, 4)" stroke="#C8102E" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 12c-2-2.67-4-4-6-4a4 4 0 1 0 0 8c2 0 4-1.33 6-4Zm0 0c2 2.67 4 4 6 4a4 4 0 0 0 0-8c-2 0-4 1.33-6 4Z"/>
+  </g>
+  <text x="32" y="21.5" font-family="Inter, Geist, -apple-system, 'Segoe UI', sans-serif" font-size="16.5" font-weight="500" letter-spacing="-0.5">
+    <tspan fill="#111111">refuseless</tspan><tspan fill="#6E6E6E" dx="5">ai</tspan>
+  </text>
+</svg>

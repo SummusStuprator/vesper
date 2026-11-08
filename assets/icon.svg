@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c1b1e"/>
+      <stop offset="1" stop-color="#0b0b0c"/>
+    </linearGradient>
+  </defs>
+  <!-- Tile -->
+  <rect x="48" y="48" width="928" height="928" rx="196" fill="url(#bg)"/>
+  <rect x="49.5" y="49.5" width="925" height="925" rx="194.5" fill="none" stroke="#ffffff" stroke-opacity=".09" stroke-width="3"/>
+  <!-- Hard-edged V with the evening star cut above its right arm (same geometry as the in-app mark, 24-unit grid) -->
+  <g transform="translate(123.2 142.4) scale(32)">
+    <path d="M2.5 4.5h4.6L12 15.2l2.6-5.7h4.6L12 21.5Z" fill="#ff2e4d"/>
+    <path d="M18.6 1.6l.95 2.25 2.25.95-2.25.95-.95 2.25-.95-2.25-2.25-.95 2.25-.95Z" fill="#f3f2ee"/>
+  </g>
+</svg>
