@@ -68,14 +68,17 @@ const shell = {
     const onData = (d) => { const s = d.toString(); out += s; ctx.progress && ctx.progress(stripAnsi(s)); };
     proc.stdout.on('data', onData);
     proc.stderr.on('data', onData);
-    const abort = () => killTree(proc);
+    let settle;
+    const done = new Promise((res) => { settle = res; });
+    // If a killed process (or a grandchild holding its pipes) never closes, give up waiting shortly after.
+    const giveUp = () => setTimeout(() => settle(-1), 3000);
+    const abort = () => { killTree(proc); giveUp(); };
     ctx.signal && ctx.signal.addEventListener('abort', abort);
     let timedOut = false;
-    const t = setTimeout(() => { timedOut = true; killTree(proc); }, timeout);
-    const code = await new Promise((res) => {
-      proc.on('close', res);
-      proc.on('error', (e) => { out += e.message; res(-1); });
-    });
+    const t = setTimeout(() => { timedOut = true; killTree(proc); giveUp(); }, timeout);
+    proc.on('close', (c) => settle(c));
+    proc.on('error', (e) => { out += e.message; settle(-1); });
+    const code = await done;
     clearTimeout(t);
     ctx.signal && ctx.signal.removeEventListener('abort', abort);
     const body = clip(stripAnsi(out)).trimEnd();

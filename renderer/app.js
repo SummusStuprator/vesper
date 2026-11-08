@@ -50,6 +50,7 @@ async function startApp() {
   else await newSession(S.cfg.recentWorkspaces[0]);
   refreshCredits();
   setInterval(refreshCredits, 90000);
+  try { S.update = await api.update.get(); renderTitleRight(); } catch {}
 }
 
 async function refreshCatalogs(force) {
@@ -73,12 +74,20 @@ async function restorePending() {
     for (const ev of p.events) registerPending(ev);
   } catch {}
 }
+// Pending approvals/questions, keyed by request id. ev.anchor is the transcript item the card attaches to
+// (for a subagent's tool call that is the parent "task" item, since subagent steps are not transcript items).
 function registerPending(ev) {
-  const itemId = ev.kind === 'question' ? ev.itemId : ev.item.id;
+  ev.anchor = ev.anchor || (ev.kind === 'question' ? ev.itemId : ev.item.id);
   if (!S.approvals.has(ev.sessionId)) S.approvals.set(ev.sessionId, new Map());
-  S.approvals.get(ev.sessionId).set(itemId, ev);
+  S.approvals.get(ev.sessionId).set(ev.requestId, ev);
   S.live.set(ev.sessionId, { busy: true, phase: ev.kind === 'question' ? 'waiting for your answer' : 'waiting for your approval' });
-  return itemId;
+  return ev;
+}
+const pendingOf = (sid) => [...((S.approvals.get(sid) || new Map()).values())];
+function attachPendingFor(itemIds) {
+  if (!S.cur) return;
+  const ids = itemIds ? new Set(itemIds) : null;
+  for (const ev of pendingOf(S.cur.id)) if (!ids || ids.has(ev.anchor)) attachPending(ev);
 }
 
 async function refreshSessions() { S.sessions = await api.sessions.list(); renderSessionList(); }
@@ -134,6 +143,7 @@ function renderTitleRight() {
   const c = S.credits;
   const low = c && c.available < 1;
   els.titleRight.replaceChildren(
+    S.update ? h('button', { class: 'btn sm upd', title: `Vesper ${S.update.version} is available`, onclick: () => api.open(S.update.url) }, icon('sparkle', 'sm'), `Update ${S.update.version}`) : null,
     hasRefuseless() ? h('div', { class: 'rl-pill', title: 'Credit balance' },
       h('button', { class: 'row', style: { border: 'none', background: 'none', padding: 0, gap: '7px' }, onclick: () => openSettings(ctx(), 'refuseless') }, icon('coins', 'sm'),
         h('span', { class: `bal ${low ? 'low' : ''}` }, c ? fmtUsd(c.available, 2) : '—')),
@@ -325,8 +335,8 @@ function renderGroup(g) {
   for (const it of work) { const n = renderItem(it); if (n) { nodes.set(it.id, n); g.bodyEl.append(n); } }
   g.workEl = null; g.headEl = null;
   if (work.length) {
-    const pend = S.approvals.get(S.cur.id);
-    const needsYou = pend && work.some((x) => pend.has(x.id));
+    const anchors = new Set(pendingOf(S.cur.id).map((e) => e.anchor));
+    const needsYou = work.some((x) => anchors.has(x.id));
     const open = live || needsYou || S.openWork.has(g.id);
     g.headEl = h('button', { class: 'work-head', onclick: () => {
       if (isLive(g)) return;
@@ -342,6 +352,14 @@ function renderGroup(g) {
   g.answerEl = h('div', { class: 'answer' });
   for (const it of answer) { const n = renderItem(it); if (n) { nodes.set(it.id, n); g.answerEl.append(n); } }
   el.append(g.answerEl);
+  if (!live && g.lead && g.lead.type === 'user' && g.items.length) {
+    const last = groups[groups.length - 1] === g;
+    el.append(h('div', { class: 'turn-acts' },
+      h('button', { class: 'btn sm ghost', title: 'Run this message again (switch model first to compare)', onclick: () => {
+        if (!last && !confirm('Retrying this message removes everything after it. Continue?')) return;
+        rewindTo(g.lead, { resend: true });
+      } }, icon('refresh', 'sm'), 'Retry')));
+  }
   if (g.el && g.el.isConnected) g.el.replaceWith(el);
   g.el = el;
   return el;
@@ -350,8 +368,7 @@ function renderGroup(g) {
 function rerenderGroup(g) {
   if (!g || !S.cur) return;
   renderGroup(g);
-  const pend = S.approvals.get(S.cur.id);
-  if (pend) for (const [itemId, a] of pend) if (g.items.some((x) => x.id === itemId)) attachPending(itemId, a);
+  attachPendingFor(g.items.map((x) => x.id));
 }
 
 function renderTranscript() {
@@ -363,8 +380,7 @@ function renderTranscript() {
   for (const g of groups) frag.append(renderGroup(g));
   frag.append(els.working = workingRow());
   t.replaceChildren(frag);
-  const pend = S.approvals.get(S.cur.id);
-  if (pend) for (const [itemId, a] of pend) attachPending(itemId, a);
+  attachPendingFor(null);
 }
 // Keep the live work header's clock ticking.
 setInterval(() => { const g = groups[groups.length - 1]; if (g && isLive(g)) renderWorkHead(g); }, 1000);
@@ -419,8 +435,34 @@ function renderUser(it) {
     it.images && it.images.length ? h('div', { class: 'imgs' }, it.images.map((src) => h('img', { src, onclick: () => lightbox(src) }))) : null,
     h('div', { class: 'u-acts' },
       h('button', { class: 'icon-btn', title: 'Copy', onclick: () => { navigator.clipboard.writeText(it.text || ''); toast('Copied'); } }, icon('copy', 'sm')),
-      h('button', { class: 'icon-btn', title: 'Put back in the composer', onclick: () => { els.ta.value = it.text || ''; autosize(els.ta); els.ta.focus(); renderSendBtn(); } }, icon('edit', 'sm')),
+      h('button', { class: 'icon-btn', title: 'Edit & resend', onclick: (e) => editMenu(it, e.currentTarget) }, icon('edit', 'sm')),
       turnEdits ? h('button', { class: 'icon-btn', title: `Revert ${turnEdits} file change(s) from this turn`, onclick: () => revertTurn(it) }, icon('undo', 'sm')) : null));
+}
+
+// Edit a sent message: rewind the conversation to it (optionally undoing file changes made since).
+function editMenu(it, anchor) {
+  const idx = S.cur.transcript.indexOf(it);
+  const laterEdits = S.cur.transcript.slice(idx).filter((x) => x.type === 'tool' && x.revertable && !x.reverted).length;
+  const opt = (label, desc, fn) => h('div', { class: 'opt', onclick: () => { closePop(); fn(); } }, h('div', { class: 'grow' }, h('div', null, label), h('div', { class: 'd' }, desc)));
+  popover(anchor, h('div', null,
+    h('div', { class: 'hdr label' }, 'Edit this message'),
+    opt('Rewind and edit', 'Remove this message and everything after it, then edit it in the composer.', () => rewindTo(it, {})),
+    laterEdits ? opt(`Rewind and undo ${laterEdits} file change${laterEdits === 1 ? '' : 's'}`, 'Also restore files Vesper changed since this message.', () => rewindTo(it, { revertFiles: true })) : null,
+    h('div', { class: 'sep' }),
+    opt('Copy into the composer', 'Keep the conversation as it is.', () => { els.ta.value = it.text || ''; autosize(els.ta); els.ta.focus(); renderSendBtn(); })), { cls: 'edit-menu', place: 'bottom', align: 'right' });
+}
+async function rewindTo(it, { revertFiles = false, resend = false } = {}) {
+  if (S.busy) return toast('Stop the current run first (Esc).');
+  try {
+    const r = await api.sessions.rewind(S.cur.id, it.id, { revertFiles });
+    S.cur = r.session;
+    renderAll();
+    if (resend) { await send(r.text, r.images); return; }
+    els.ta.value = r.text; autosize(els.ta);
+    if (r.images && r.images.length) { S.attachments = r.images.map((image, i) => ({ name: `image ${i + 1}`, image })); renderAttachments(); }
+    renderSendBtn(); els.ta.focus();
+    toast(r.reverted.length ? `Rewound. ${r.reverted.length} file${r.reverted.length === 1 ? '' : 's'} restored.` : 'Rewound. Edit and send.');
+  } catch (e) { toast(e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 'err'); }
 }
 
 async function revertTurn(it) {
@@ -554,8 +596,7 @@ function replaceNode(it) {
   const old = nodes.get(it.id);
   const n = renderItem(it);
   if (old && n) { old.replaceWith(n); nodes.set(it.id, n); }
-  const pend = S.approvals.get(S.cur.id);
-  if (pend && pend.has(it.id)) attachPending(it.id, pend.get(it.id));
+  attachPendingFor([it.id]);
 }
 
 function appendItem(it) {
@@ -580,20 +621,21 @@ function appendItem(it) {
 }
 
 // ───────────────────────────────────────────── approvals & questions
-function attachPending(itemId, a) {
-  const node = nodes.get(itemId);
+function attachPending(a) {
+  const node = nodes.get(a.anchor);
   if (!node) return;
-  node.querySelector('.approval') && node.querySelector('.approval').remove();
+  const sel = `.approval[data-req="${a.requestId}"]`;
+  node.querySelector(sel) && node.querySelector(sel).remove();
   const done = () => {
-    const pend = S.approvals.get(S.cur.id); pend && pend.delete(itemId);
-    node.querySelector('.approval') && node.querySelector('.approval').remove();
+    const pend = S.approvals.get(a.sessionId); pend && pend.delete(a.requestId);
+    node.querySelector(sel) && node.querySelector(sel).remove();
     renderSessionList();
   };
   if (a.kind === 'question') {
     const inp = h('input', { class: 'input', placeholder: 'Type an answer…' });
     const answer = async (text) => { if (!text) return; await api.agent.reply({ requestId: a.requestId, answer: text }); done(); };
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') answer(inp.value.trim()); });
-    node.append(h('div', { class: 'approval' },
+    node.append(h('div', { class: 'approval', 'data-req': a.requestId },
       h('div', { class: 'q' }, icon('user', 'sm'), a.question),
       a.options && a.options.length ? h('div', { class: 'opts' }, a.options.map((o) => h('button', { class: 'btn sm', onclick: () => answer(o) }, o))) : null,
       h('div', { class: 'acts' }, inp, h('button', { class: 'btn primary sm', onclick: () => answer(inp.value.trim()) }, 'Answer'))));
@@ -611,7 +653,7 @@ function attachPending(itemId, a) {
   else if (it.name === 'multi_edit') preview = `${it.args.path}\n\n${(it.args.edits || []).map((e, i) => `#${i + 1}\n− ${String(e.old_string).slice(0, 600)}\n+ ${String(e.new_string).slice(0, 600)}`).join('\n\n')}`;
   else preview = JSON.stringify(it.args, null, 2);
   const q = { shell: 'Run this command?', write_file: 'Write this file?', edit_file: 'Apply this edit?', multi_edit: 'Apply these edits?', computer: 'Let Vesper control your computer?' }[it.name] || `Allow ${it.name}?`;
-  const card = h('div', { class: `approval ${a.guard ? 'guard' : ''}` },
+  const card = h('div', { class: `approval ${a.guard ? 'guard' : ''}`, 'data-req': a.requestId },
     h('div', { class: 'q' }, icon('shield', 'sm'), q, a.depth ? h('span', { class: 'tag' }, 'subagent') : null),
     a.reason ? h('div', { class: 'why' }, icon('shield', 'sm'), `Guard: ${a.reason}`) : null,
     h('div', { class: 'preview' }, h('pre', null, preview)),
@@ -653,9 +695,14 @@ api.on.agent((ev) => {
     return;
   }
   if (ev.kind === 'approval' || ev.kind === 'question') {
-    const itemId = registerPending(ev);
+    registerPending(ev);
     const phase = S.live.get(sid).phase;
-    if (S.cur && S.cur.id === sid) { S.phase = phase; updateWorking(); attachPending(itemId, ev); }
+    if (S.cur && S.cur.id === sid) {
+      S.phase = phase; updateWorking();
+      // Make sure the card is visible even if its work block was collapsed.
+      const g = groups.find((x) => x.items.some((i) => i.id === ev.anchor));
+      if (g && g.workEl && !g.workEl.classList.contains('open')) rerenderGroup(g); else attachPending(ev);
+    }
     else toast('A session is waiting for you');
     renderSessionList();
     return;
@@ -706,6 +753,7 @@ api.on.agent((ev) => {
   }
 });
 api.on.sessions(() => refreshSessions());
+api.on.update((info) => { S.update = info; renderTitleRight(); toast(`Vesper ${info.version} is available. Click Update in the title bar.`); });
 
 function scrollBottom(force) {
   if (!els.scroller) return;

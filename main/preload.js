@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('vesper', {
     rename: (id, t) => call('sessions:rename', id, t),
     update: (id, p) => call('sessions:update', id, p),
     fork: (id) => call('sessions:fork', id),
+    rewind: (id, userItemId, opts) => call('sessions:rewind', id, userItemId, opts),
   },
   agent: {
     send: (o) => call('agent:send', o),
@@ -70,5 +71,7 @@ contextBridge.exposeInMainWorld('vesper', {
     mcp: on('mcp:changed'),
     signupState: on('signup:state'),
     signupKey: on('signup:key'),
+    update: on('update:available'),
   },
+  update: { get: () => call('update:get') },
 });

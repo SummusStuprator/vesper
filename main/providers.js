@@ -188,7 +188,12 @@ function costOf(usage, pricing) {
 
 // ---------- Streaming chat ----------
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal && signal.aborted) return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+  const t = setTimeout(() => { signal && signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+  const onAbort = () => { clearTimeout(t); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })); };
+  signal && signal.addEventListener('abort', onAbort, { once: true });
+});
 
 /**
  * Stream one chat completion.
@@ -202,13 +207,21 @@ async function streamChat(provider, body, handlers = {}, signal) {
 
   let res;
   for (let attempt = 0; ; attempt++) {
-    res = await httpFetch(url, { method: 'POST', headers: Object.assign(headersFor(provider), { Accept: 'text/event-stream' }), body: JSON.stringify(payload), signal });
+    try {
+      res = await httpFetch(url, { method: 'POST', headers: Object.assign(headersFor(provider), { Accept: 'text/event-stream' }), body: JSON.stringify(payload), signal });
+    } catch (e) {
+      // Connection-level failure (offline, reset, DNS): retry with backoff; long agent runs should ride these out.
+      if ((signal && signal.aborted) || attempt >= 5) throw e;
+      handlers.onRetry && handlers.onRetry(attempt + 1, new Error(`network: ${e.message}`));
+      await sleep(Math.min(30000, 1500 * 2 ** attempt), signal);
+      continue;
+    }
     if (res.ok) break;
     const err = await readError(res);
     const retriable = res.status === 429 || res.status >= 500;
-    if (!retriable || attempt >= 3 || err.code === 'blocked') throw err;
+    if (!retriable || attempt >= 5 || err.code === 'blocked') throw err;
     handlers.onRetry && handlers.onRetry(attempt + 1, err);
-    await sleep(err.retryAfter ? err.retryAfter * 1000 : 1000 * 2 ** attempt);
+    await sleep(Math.min(60000, err.retryAfter ? err.retryAfter * 1000 : 1000 * 2 ** attempt), signal);
   }
 
   const ctype = res.headers.get('content-type') || '';

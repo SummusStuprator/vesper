@@ -20,13 +20,20 @@ const KEEP_IMAGES = 3;
 
 // ---------------------------------------------------------------- prompt
 
+// Read at most `max` bytes: an enormous instructions file must not stall the app.
+function readHead(p, max) {
+  const fd = fs.openSync(p, 'r');
+  try { const b = Buffer.alloc(max); const n = fs.readSync(fd, b, 0, max, 0); return b.subarray(0, n).toString('utf8'); }
+  finally { fs.closeSync(fd); }
+}
+
 function projectInstructions(ws) {
   const names = ['AGENTS.md', 'VESPER.md', 'CLAUDE.md', '.cursorrules', '.github/copilot-instructions.md'];
   const parts = [];
   for (const n of names) {
     try {
       const p = path.join(ws, n);
-      if (fs.existsSync(p)) parts.push(`<file path="${n}">\n${fs.readFileSync(p, 'utf8').slice(0, 20000)}\n</file>`);
+      if (fs.existsSync(p)) parts.push(`<file path="${n}">\n${readHead(p, 20000)}\n</file>`);
     } catch {}
   }
   return parts.join('\n\n');
@@ -107,7 +114,7 @@ function prepareMessages(context, keepImages = KEEP_IMAGES, vision = true) {
       out.unshift(Object.assign({}, m, { content }));
     } else out.unshift(m);
   }
-  return out.map(({ _meta, reasoning, ...m }) => m);
+  return out.map(({ _meta, _tid, reasoning, ...m }) => m);
 }
 
 function contextTokens(context) { return context.reduce((n, m) => n + estTokens(textOf(m.content)) + estTokens(m.tool_calls || ''), 0); }
@@ -260,7 +267,8 @@ ${m.text || ''}`;
           config: runner.config, provider: runner.provider, model: subModel, models: runner.models,
           signal: ctx.signal, depth: 1, readOnly: a.mode !== 'general',
           role: a.mode === 'general' ? 'You may read, edit files and run commands to complete your task.' : 'You are read-only: research and report; do not attempt edits.',
-          approve: runner.approve,
+          // A subagent's approval card is shown on the parent's "task" row.
+          approve: (o) => runner.approve(Object.assign({}, o, { anchorId: ctx.itemId, depth: 1 })),
           emit: (ev) => {
             if (ev.kind === 'item:add' && ev.item.type === 'tool') ctx.child({ id: ev.item.id, name: ev.item.name, summary: ev.item.summary, status: ev.item.status });
             if (ev.kind === 'item:update' && ev.patch.status) ctx.child({ id: ev.id, status: ev.patch.status });
@@ -293,6 +301,7 @@ ${m.text || ''}`;
     if (this.depth === 0) {
       this.turnId = null;
       this.turnId = this.add({ type: 'user', text: input.text, images: input.images || [] }).id;
+      s.context[s.context.length - 1]._tid = this.turnId; // lets the user rewind to this message later
       if (input.images && input.images.length && !vision) this.add({ type: 'notice', text: `${this.model.id} does not accept images, so the attachment was left out. Pick a vision model to send images.` });
     }
 
@@ -301,6 +310,7 @@ ${m.text || ''}`;
     const maxTurns = this.depth === 0 && Number(this.config.maxTurns) > 0 ? Number(this.config.maxTurns) : Infinity;
     let retriedOverflow = false;
     let emptyRetries = 0;
+    let streamRetries = 0;
     let continuations = 0;
     this.loopSig = null; this.loopCount = 0;
 
@@ -351,23 +361,36 @@ ${m.text || ''}`;
           this.update(item, { streaming: false, interrupted: true });
           break;
         }
+        const dropItem = () => {
+          if (this.depth === 0) this.session.transcript = this.session.transcript.filter((x) => x !== item);
+          this.emit({ kind: 'item:remove', id: item.id });
+        };
         const overflow = /context|too long|maximum.*tokens|token limit/i.test(e.message) && e.status === 400;
         if (overflow && !retriedOverflow) {
           retriedOverflow = true;
-          this.depth === 0 && this.session.transcript.pop();
-          this.emit({ kind: 'item:remove', id: item.id });
+          dropItem();
           await this.compact('overflow');
+          turn--; continue;
+        }
+        // The connection dropped mid-stream (no HTTP status): redo this step instead of failing the run.
+        if (!e.status && streamRetries < 4) {
+          streamRetries++;
+          dropItem();
+          this.emit({ kind: 'status', busy: true, phase: `connection lost, retrying (${streamRetries})` });
+          try { await new Promise((r, j) => { const t = setTimeout(r, 2000 * 2 ** streamRetries); this.signal && this.signal.addEventListener('abort', () => { clearTimeout(t); j(new Error('aborted')); }, { once: true }); }); }
+          catch { break; }
           turn--; continue;
         }
         this.update(item, { streaming: false });
         if (this.depth === 0) {
-          if (!item.text && !item.reasoning) { this.session.transcript.pop(); this.emit({ kind: 'item:remove', id: item.id }); }
+          if (!item.text && !item.reasoning) dropItem();
           this.add({ type: 'error', text: e.message, code: e.code, status: e.status });
         }
         throw e;
       }
 
       const msg = result.message;
+      streamRetries = 0;
       const ms = Date.now() - t0;
       const usage = result.usage || {
         prompt_tokens: estTokens(body.messages) + estTokens(body.tools), completion_tokens: estTokens(msg.content) + estTokens(msg.reasoning) + estTokens(msg.tool_calls || ''), estimated: true,
@@ -535,7 +558,7 @@ ${m.text || ''}`;
     // Run read-only / no-approval calls in parallel when the whole batch qualifies.
     const parallel = prepared.every((p) => p.tool && !p.parseError && (p.tool.parallel || p.tool.kind === 'read' || p.tool.kind === 'net') && p.verdict.action === 'allow');
     let results;
-    if (parallel && prepared.length > 1) results = await Promise.all(prepared.map(exec));
+    if (parallel && prepared.length > 1 && !(this.signal && this.signal.aborted)) results = await Promise.all(prepared.map(exec));
     else {
       results = [];
       for (const p of prepared) {
@@ -557,7 +580,8 @@ ${m.text || ''}`;
   // -------------------------------------------------------------- compaction
 
   shouldCompact() {
-    const used = this.session.lastPromptTokens || contextTokens(this.session.context);
+    // The last request's real token count misses tool results added since, so take the larger estimate.
+    const used = Math.max(this.session.lastPromptTokens || 0, contextTokens(this.session.context));
     return used > (this.config.compactThreshold || 0.8) * this.contextLength;
   }
 

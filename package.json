@@ -120,10 +120,6 @@
       "icon": "assets/icon-1024.png",
       "maintainer": "SummusStuprator",
       "synopsis": "Desktop coding agent"
-    },
-    "publish": {
-      "provider": "github",
-      "releaseType": "draft"
     }
   }
 }

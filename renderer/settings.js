@@ -50,6 +50,7 @@ export function openSettings(app, start = 'general') {
       row('Appearance', 'Light is the default. Ctrl+J toggles.', seg([['light', 'Light'], ['dark', 'Dark'], ['system', 'System']], c.theme, async (k) => { await save({ theme: k }); render(); })),
       row('Session budget', 'Stop a session once it has spent this much (USD). 0 means no limit.',
         h('input', { class: 'input', type: 'number', min: 0, step: 0.5, value: c.sessionBudget || 0, style: { width: '110px' }, onchange: (e) => save({ sessionBudget: Math.max(0, Number(e.target.value) || 0) }) })),
+      row('Check for updates', 'Look for a newer Vesper release on GitHub at startup. Nothing about you is sent.', toggle(c.checkUpdates !== false, (v) => save({ checkUpdates: v }))),
       row('Desktop notifications', 'Notify when a run finishes or needs you while Vesper is in the background.', toggle(c.notifyOnFinish !== false, (v) => save({ notifyOnFinish: v }))),
       row('Auto-compact', 'Summarize older messages automatically as the context window fills.', toggle(c.autoCompact, (v) => save({ autoCompact: v }))),
       row('Compact threshold', 'Share of the context window that triggers auto-compaction.',

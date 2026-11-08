@@ -54,6 +54,7 @@ const DEFAULT_CONFIG = {
   maxOutputTokens: 0,        // per response, 0 = provider default
   sessionBudget: 0,          // USD per session, 0 = unlimited
   notifyOnFinish: true,
+  checkUpdates: true,        // look for a newer release on GitHub at startup (no data is sent)
   memoryEnabled: true,
   tools: { web: true, computer: false, subagents: true, shell: true, mcp: true, hideOnScreenshot: true },
   search: { engine: 'duckduckgo', braveKey: '', tavilyKey: '' },
@@ -109,8 +110,8 @@ function listSessions() {
   return onDisk.concat([...memIndex.values()]).sort((a, b) => (b.pinned - a.pinned) || (b.updatedAt - a.updatedAt));
 }
 function loadSession(id) { return readSessionFile(file('sessions', id + '.json')); }
-function saveSession(s) {
-  s.updatedAt = Date.now();
+function saveSession(s, opts = {}) {
+  if (!opts.keepTime || !s.updatedAt) s.updatedAt = Date.now();
   if (s.incognito) {
     memIndex.set(s.id, { id: s.id, title: s.title, workspace: s.workspace, updatedAt: s.updatedAt, cost: (s.usage && s.usage.cost) || 0, model: s.model, incognito: true, pinned: !!s.pinned });
     return;
@@ -128,7 +129,7 @@ function reencryptAll() {
   let n = 0;
   for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.json'))) {
     const s = readSessionFile(path.join(dir, f));
-    if (s) { const t = s.updatedAt; saveSession(s); s.updatedAt = t; n++; }
+    if (s) { saveSession(s, { keepTime: true }); n++; }
   }
   return n;
 }

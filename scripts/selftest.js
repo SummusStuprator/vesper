@@ -78,6 +78,8 @@ const ok = (name) => { passed++; console.log('  ✓', name); };
   assert.strictEqual(D(editTool, { path: path.join(os.homedir(), 'elsewhere.txt') }, 'edits'), 'ask');
   assert.strictEqual(D(readTool, { path: '~/.ssh/id_rsa' }, 'auto'), 'ask');
   assert.strictEqual(D(readTool, { path: 'src/.env' }, 'auto'), 'ask');
+  assert.strictEqual(D(shellTool, { command: 'echo hi', cwd: os.tmpdir() }, 'auto'), 'ask');
+  assert.strictEqual(D(shellTool, { command: 'echo hi', cwd: 'src' }, 'auto'), 'allow');
   assert.strictEqual(D({ name: 'web_fetch', kind: 'net' }, { url: 'https://evil.example/x' }, 'full'), 'allow');
   assert.strictEqual(sec.decide({ tool: { name: 'web_fetch', kind: 'net' }, args: { url: 'https://evil.example/x' }, mode: 'full', allowed: new Set(), workspace: ws, sec: Object.assign({}, S, { blockedDomains: ['other.test'], allowedDomains: [] }), resolvePath: rp }).action, 'allow');
   assert.strictEqual(sec.decide({ tool: { name: 'web_fetch', kind: 'net' }, args: { url: 'https://a.evil.example/x' }, mode: 'full', allowed: new Set(), workspace: ws, sec: Object.assign({}, S, { blockedDomains: ['evil.example'] }), resolvePath: rp }).action, 'deny');
@@ -149,7 +151,9 @@ const ok = (name) => { passed++; console.log('  ✓', name); };
       const b = JSON.parse(body); bodies.push(b);
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
       const step = script.length > 1 ? script.shift() : script[0];
-      for (const ev of await step(b)) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+      const evs = await step(b);
+      if (evs === 'DROP') { res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'partial…' } }] })}\n\n`); setTimeout(() => res.destroy(), 20); return; }
+      for (const ev of evs) res.write(`data: ${JSON.stringify(ev)}\n\n`);
       res.end('data: [DONE]\n\n');
     });
   });
@@ -202,6 +206,28 @@ const ok = (name) => { passed++; console.log('  ✓', name); };
   bodies = [];
   assert.strictEqual(await mk(s2).run({ text: 'long task' }), 'finished');
   assert.ok(bodies.length >= 120); ok(`unlimited steps (${bodies.length} model calls in one turn)`);
+  // Connection dropped mid-stream → the step is retried, the run survives.
+  s2 = fresh();
+  script = [() => 'DROP', say('Recovered.')];
+  bodies = [];
+  assert.strictEqual(await mk(s2).run({ text: 'hello' }), 'Recovered.');
+  assert.ok(!s2.transcript.some((x) => x.type === 'error')); ok('dropped stream retried without failing the run');
+
+  // A subagent's approval request is anchored to the parent's task row (so the UI can show it).
+  s2 = fresh();
+  const asks = [];
+  script = [
+    callTool('task', { description: 'run it', prompt: 'run echo hi', mode: 'general' }, 'p1'),
+    callTool('shell', { command: 'echo hi' }, 'k1'),
+    say('subagent done'),
+    say('all done'),
+  ];
+  bodies = [];
+  const rs = mk(s2, { config: Object.assign({}, config, { maxTurns: 0, permissionMode: 'ask', subagentModel: null }), approve: async (o) => { asks.push(o); return { decision: 'once' }; } });
+  assert.strictEqual(await rs.run({ text: 'delegate' }), 'all done');
+  const taskItem = s2.transcript.find((x) => x.type === 'tool' && x.name === 'task');
+  assert.ok(asks.length === 1 && asks[0].anchorId === taskItem.id && asks[0].depth === 1, JSON.stringify(asks.map((a) => a.anchorId)));
+  assert.ok(s2.usage.requests >= 4); ok('subagent approvals anchored to the task row; subagent cost rolled up');
   srv2.close();
 
   fs.rmSync(tmp, { recursive: true, force: true });

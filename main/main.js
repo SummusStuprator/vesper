@@ -59,6 +59,51 @@ async function resolveModel(providerId, modelId) {
   return c.models.find((m) => m.id === modelId) || { id: modelId, providerId, pricing: null };
 }
 
+// Put files back to their snapshot before the given tool calls (newest first). Returns restored paths.
+function restoreSnapshots(sessionId, items) {
+  const files = [];
+  for (const it of [...items].reverse()) {
+    const snap = store.loadSnapshot(sessionId, it.id);
+    if (!snap) continue;
+    if (snap.before === null) { if (fs.existsSync(snap.file)) shell.trashItem(snap.file); }
+    else fs.writeFileSync(snap.file, snap.before);
+    it.reverted = true;
+    files.push(snap.file);
+  }
+  return files;
+}
+
+// ------------------------------------------------------------------ update check
+// Asks GitHub for the latest release of this repository (from package.json). Sends nothing about you.
+let updateInfo = null;
+function repoSlug() {
+  try {
+    const r = require('../package.json').repository;
+    const m = String((r && r.url) || r || '').match(/github\.com[/:]([^/]+)\/([^/.]+)/);
+    return m ? `${m[1]}/${m[2]}` : null;
+  } catch { return null; }
+}
+function newer(a, b) {
+  const pa = String(a).replace(/^v/, '').split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
+  return false;
+}
+async function checkForUpdate() {
+  const slug = repoSlug();
+  if (!slug || config.checkUpdates === false) return;
+  try {
+    const { net } = require('electron');
+    const res = await net.fetch(`https://api.github.com/repos/${slug}/releases/latest`, { headers: { 'User-Agent': 'Vesper', Accept: 'application/vnd.github+json' } });
+    if (!res.ok) return;
+    const j = await res.json();
+    if (j && j.tag_name && newer(j.tag_name, app.getVersion())) {
+      updateInfo = { version: j.tag_name.replace(/^v/, ''), url: j.html_url, notes: String(j.body || '').slice(0, 2000) };
+      send('update:available', updateInfo);
+    }
+  } catch {}
+}
+
 function persistSession(s) { if (deleted.has(s.id)) return; try { store.saveSession(s); } catch (e) { console.error('save failed', e); } }
 
 // Vesper was closed (or crashed) mid-run: settle what was in flight so the session can continue cleanly.
@@ -147,10 +192,10 @@ function makeRunner(s, model, controller) {
       send('agent:event', Object.assign({ sessionId: s.id }, ev));
       if (!saveT) saveT = setTimeout(() => { saveT = null; persistSession(s); }, 1500);
     },
-    approve: ({ item, depth, reason, guard }) => new Promise((resolve) => {
+    approve: ({ item, depth, reason, guard, anchorId }) => new Promise((resolve) => {
       const requestId = newId();
       approvals.set(requestId, resolve);
-      const ev = { sessionId: s.id, kind: 'approval', requestId, item: { id: item.id, name: item.name, args: item.args, summary: item.summary, kind: item.kind }, depth, reason, guard };
+      const ev = { sessionId: s.id, kind: 'approval', requestId, anchor: anchorId || item.id, item: { id: item.id, name: item.name, args: item.args, summary: item.summary, kind: item.kind }, depth, reason, guard };
       pendingEvents.set(requestId, ev);
       send('agent:event', ev);
       controller.signal.addEventListener('abort', () => { pendingEvents.delete(requestId); if (approvals.has(requestId)) { approvals.delete(requestId); resolve({ decision: 'deny', feedback: 'Run was stopped.' }); } });
@@ -159,7 +204,7 @@ function makeRunner(s, model, controller) {
     ask: ({ itemId, question, options }) => new Promise((resolve) => {
       const requestId = newId();
       approvals.set(requestId, resolve);
-      const ev = { sessionId: s.id, kind: 'question', requestId, itemId, question, options };
+      const ev = { sessionId: s.id, kind: 'question', requestId, anchor: itemId, itemId, question, options };
       pendingEvents.set(requestId, ev);
       send('agent:event', ev);
       controller.signal.addEventListener('abort', () => { pendingEvents.delete(requestId); if (approvals.has(requestId)) { approvals.delete(requestId); resolve({ answer: '' }); } });
@@ -217,7 +262,7 @@ function registerIpc() {
     }
     if (!!config.security.encryptSessions !== wasEncrypted) {
       const on = store.setSessionEncryption(config.security.encryptSessions);
-      if (config.security.encryptSessions && !on) { config.security.encryptSessions = false; throw new Error('OS encryption is not available on this system.'); }
+      if (config.security.encryptSessions && !on) { config.security.encryptSessions = false; store.saveConfig(config); throw new Error('OS encryption is not available on this system.'); }
       store.reencryptAll();
     }
     store.saveConfig(config);
@@ -291,8 +336,14 @@ function registerIpc() {
   handle('sessions:load', (id) => { const s = getSession(id); if (!s) throw new Error('Session not found'); return strip(s); });
   handle('sessions:delete', (id) => { if (runs.has(id)) deleted.add(id); stopRun(id); sessions.delete(id); store.deleteSession(id); return true; });
   handle('sessions:rename', (id, title) => { const s = getSession(id); s.title = title; persistSession(s); return true; });
-  handle('sessions:update', (id, patch) => {
+  handle('sessions:update', async (id, patch) => {
     const s = getSession(id);
+    const r = runs.get(id);
+    if (r && r.runner && (patch.model || patch.providerId)) {
+      const pid = patch.providerId || s.providerId;
+      const p = providerById(pid);
+      if (p) { r.runner.provider = p; r.runner.model = await resolveModel(p.id, patch.model || s.model); r.runner.models = (catalogs.get(p.id) || {}).models || []; }
+    }
     if ('workspace' in patch) patch.workspace = checkWorkspace(patch.workspace);
     for (const k of ['providerId', 'model', 'effort', 'workspace']) if (k in patch) s[k] = patch[k];
     if (patch.workspace) rememberWorkspace(patch.workspace);
@@ -300,7 +351,26 @@ function registerIpc() {
     persistSession(s);
     return strip(s);
   });
+  // Rewind: drop a message and everything after it (optionally undoing the file changes made since),
+  // so it can be edited and sent again.
+  handle('sessions:rewind', (id, userItemId, opts = {}) => {
+    if (runs.has(id)) throw new Error('Stop the current run before rewinding.');
+    const s = getSession(id);
+    const ti = s.transcript.findIndex((x) => x.id === userItemId);
+    if (ti < 0) throw new Error('Message not found.');
+    const ci = s.context.findIndex((m) => m._tid === userItemId);
+    if (ci < 0) throw new Error('That message was compacted into a summary, so the conversation cannot be rewound to it. Fork the session or just send a new message.');
+    const item = s.transcript[ti];
+    const later = s.transcript.slice(ti).filter((x) => x.type === 'tool' && x.revertable && !x.reverted);
+    const files = opts.revertFiles ? restoreSnapshots(id, later) : [];
+    s.transcript = s.transcript.slice(0, ti);
+    s.context = s.context.slice(0, ci);
+    s.lastPromptTokens = 0;
+    persistSession(s);
+    return { text: item.text || '', images: item.images || [], reverted: [...new Set(files)], session: strip(s) };
+  });
   handle('sessions:fork', (id, uptoItemId) => {
+    if (runs.has(id)) throw new Error('Wait for the current run to finish (or stop it) before forking.');
     const src = getSession(id);
     const s = newSession(src.workspace);
     Object.assign(s, JSON.parse(JSON.stringify({ context: src.context, transcript: src.transcript, usage: { input: 0, cached: 0, output: 0, cost: 0, requests: 0 }, todos: src.todos, providerId: src.providerId, model: src.model, effort: src.effort })));
@@ -349,6 +419,7 @@ function registerIpc() {
     return r.runner.interject({ text: String(text || ''), images: Array.isArray(images) ? images.slice(0, 8) : [], qid });
   });
   handle('agent:stop', (sessionId) => { stopRun(sessionId); return true; });
+  handle('update:get', () => updateInfo);
   // What the UI needs to rebuild after a reload: which sessions are running and what they wait on.
   handle('agent:pending', () => ({ running: [...runs.keys()], events: [...pendingEvents.values()] }));
   handle('agent:compact', async (sessionId, instructions) => {
@@ -372,15 +443,7 @@ function registerIpc() {
   handle('agent:revertTurn', (sessionId, userItemId) => {
     const s = getSession(sessionId);
     const items = s.transcript.filter((x) => x.type === 'tool' && x.turn === userItemId && x.revertable && !x.reverted);
-    const files = [];
-    for (const it of items.reverse()) {
-      const snap = store.loadSnapshot(sessionId, it.id);
-      if (!snap) continue;
-      if (snap.before === null) { if (fs.existsSync(snap.file)) shell.trashItem(snap.file); }
-      else fs.writeFileSync(snap.file, snap.before);
-      it.reverted = true;
-      files.push(snap.file);
-    }
+    const files = restoreSnapshots(sessionId, items);
     if (files.length) {
       s.context.push({ role: 'user', content: `[Note from the harness: the user reverted all file changes from one of your turns. These files are back to their earlier content: ${[...new Set(files)].join(', ')}]` });
       s.context.push({ role: 'assistant', content: 'Noted.' });
@@ -426,7 +489,7 @@ function registerIpc() {
   handle('audit:list', (n) => security.readAudit(n || 300));
   handle('audit:clear', () => { security.clearAudit(); return true; });
   handle('data:wipe', async (what) => {
-    for (const id of [...runs.keys()]) stopRun(id);
+    for (const id of [...runs.keys()]) { if (!what || what.sessions !== false) deleted.add(id); stopRun(id); }
     sessions.clear();
     store.wipe(what || {});
     if (!what || what.audit !== false) security.clearAudit();
@@ -647,13 +710,16 @@ app.whenReady().then(() => {
   store.init(path.join(app.getPath('userData'), 'vesper'));
   config = store.loadConfig();
   security.initAudit(store.dataDir());
-  store.setSessionEncryption(config.security.encryptSessions);
+  // Never claim encryption at rest when the OS cannot provide it.
+  if (config.security.encryptSessions && !store.setSessionEncryption(true)) { config.security.encryptSessions = false; store.saveConfig(config); }
   harden();
   nativeTheme.themeSource = config.theme || 'system';
   Menu.setApplicationMenu(process.platform === 'darwin' ? Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' }]) : null);
   registerIpc();
   createWindow();
   mcp.syncServers(config.mcpServers).then(() => send('mcp:changed', null));
+  setTimeout(checkForUpdate, 8000);
+  setInterval(checkForUpdate, 6 * 3600 * 1000);
 });
 
 app.on('window-all-closed', () => {

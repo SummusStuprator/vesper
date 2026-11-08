@@ -60,7 +60,8 @@ Installers for every release are on the **[Releases page](../../releases/latest)
 - **No step cap.** A turn runs until the work is done. A loop detector stops a run that repeats the same call with the same result, and you can set an optional step limit.
 - **Talk to it while it works.** Messages sent during a run are **queued** and go out when it finishes. You can edit them in place, pull them back into the composer (↑ recalls the last one), or hit **Send now** to deliver one at the agent's next step without stopping it.
 - **Readable transcripts.** Each turn's thinking, tool calls, intermediate replies and mid-run messages fold into one collapsible **work block**, with the final answer underneath.
-- **Self-recovery.** Replies cut off by the output limit continue automatically. A model that thinks without acting is nudged to act. A run interrupted by closing the app resumes cleanly. Approvals survive a reload.
+- **Rewind and retry.** Edit any earlier message and resend it from there, optionally undoing the file changes made since. Retry a turn after switching models to compare. A model or effort change applies to a running agent at its next step.
+- **Self-recovery.** Replies cut off by the output limit continue automatically. A model that thinks without acting is nudged to act. Dropped connections and provider errors are retried with backoff. A run interrupted by closing the app resumes cleanly. Approvals survive a reload, and a subagent's approval requests appear on its task row.
 - **Context management.** A live context meter, automatic compaction at a threshold you choose, manual `/compact [focus]`, and recovery when the context overflows.
 
 ### Cost & models
@@ -91,7 +92,7 @@ In every mode except **Full access**, guards always ask before:
 "Always allow" never overrides a guard.
 
 ## Privacy & security
-- **No telemetry, no analytics.** Requests go only to the providers you configure and the sites the agent visits.
+- **No telemetry, no analytics.** Requests go only to the providers you configure, the sites the agent visits, and (once at startup, optional) GitHub's public releases API to check for a newer version.
 - API keys are encrypted with the OS keychain (`safeStorage`).
 - **Secret redaction** on all tool output: API keys, tokens, private keys, connection strings, dotenv secrets and your own configured keys are removed before the model sees them.
 - **Prompt-injection fencing:** web and MCP output is wrapped as untrusted content, and the model is told never to follow instructions inside it.
@@ -126,6 +127,13 @@ npm run dist:mac     # DMG (arm64 + x64), must run on macOS
 npm run dist:linux   # AppImage + .deb
 ```
 
+**Publishing your fork:** `scripts/publish.ps1` (PowerShell on Windows, `pwsh` on macOS/Linux) creates the GitHub repository under your account, pushes, and tags a release. It also removes AI-attribution lines from unpublished commit history, so you are the sole author. Try `-DryRun` first. `-PublishRelease` waits for the builds and publishes the release.
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/publish.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts/publish.ps1 -PublishRelease
+```
+
 **Releases:** push a tag like `v0.2.0`. GitHub Actions (`.github/workflows/release.yml`) builds all three platforms and attaches the installers to a draft release. Review the draft, then publish it.
 
 Other scripts: `npm run icons` re-renders `assets/icon.png` / `icon.ico` from `assets/icon.svg`. `npm run shortcut` adds Desktop and Start menu shortcuts for a source checkout on Windows.
@@ -136,7 +144,7 @@ main/         Electron main process: window, IPC, agent loop, providers, securit
 main/tools/   fs, shell, web, computer use, MCP client
 renderer/     UI (vanilla ES modules, no build step)
 assets/       icons and logos
-scripts/      self-test, icon renderer, shortcut helper, CDP dev driver
+scripts/      self-test, publish script, icon renderer, shortcut helper, CDP dev driver
 ```
 
 ## Data location

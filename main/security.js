@@ -185,6 +185,11 @@ function decide({ tool, args, mode, allowed, workspace, sec, resolvePath }) {
     const why = dangerousCommand(args.command);
     if (why) guard = `risky command: ${why}`;
   }
+  if (!guard && tool.name === 'shell' && sec.confineWrites && args && args.cwd) {
+    const c = resolvePath(args.cwd);
+    if (outsideWorkspace(c, workspace)) guard = 'runs outside the workspace';
+    else { const s2 = sensitiveMatch(c, sec); if (s2) guard = `runs in a protected path (${s2})`; }
+  }
   if (guard) return { action: 'ask', reason: guard, guard: true };
 
   if (allowed && allowed.has(tool.name)) return { action: 'allow' };
