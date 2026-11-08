@@ -21,7 +21,7 @@
 
 Vesper is an agent that works on your own machine with real tools. It reads and edits files, runs commands, searches the web, hands work to subagents and can operate the desktop. It is made for long sessions: the context compacts itself as it fills, cost is tracked to the token, and you can keep talking to it while it works.
 
-Built primarily around Refuseless AI's open-weight abliterated models, this harness is perfect for cybersecurity work, reverse-engineering and privacy-conscious developers.
+Built primarily around Refuseless AI's open-weight abliterated models, this harness is perfect for cybersecurity work, reverse-engineering and privacy-conscious development.
 
 ## Download
 
