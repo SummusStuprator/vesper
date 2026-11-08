@@ -49,8 +49,9 @@ const DEFAULT_CONFIG = {
   autoCompact: true,
   compactThreshold: 0.8,
   theme: 'light',
-  maxTurns: 80,
-  maxOutputTokens: 32000,
+  configVersion: 2,
+  maxTurns: 0,               // agent steps per message, 0 = unlimited (long-running agents)
+  maxOutputTokens: 0,        // per response, 0 = provider default
   sessionBudget: 0,          // USD per session, 0 = unlimited
   notifyOnFinish: true,
   memoryEnabled: true,
@@ -70,6 +71,12 @@ function loadConfig() {
   c.providers = (c.providers || []).map((p) => Object.assign({}, p, { apiKey: unseal(p.apiKey) }));
   c.search.braveKey = unseal(c.search.braveKey);
   c.search.tavilyKey = unseal(c.search.tavilyKey);
+  if (!(c.configVersion >= 2)) {
+    // v2: step and output caps removed by default (they cut long agent runs short).
+    if (c.maxTurns === 80) c.maxTurns = 0;
+    if (c.maxOutputTokens === 32000) c.maxOutputTokens = 0;
+    c.configVersion = 2;
+  }
   return c;
 }
 function saveConfig(c) {

@@ -13,7 +13,9 @@ const store = require('./store');
 
 const uid = () => crypto.randomBytes(6).toString('hex');
 const estTokens = (v) => Math.ceil((typeof v === 'string' ? v : JSON.stringify(v || '')).length / 3.6);
-const MAX_TOOL_CHARS = 60000;
+const MAX_TOOL_CHARS = 100000;
+const LOOP_NUDGE = 4;   // identical call+result this many times in a row → tell the model it is looping
+const LOOP_STOP = 8;    // …and this many → stop the run
 const KEEP_IMAGES = 3;
 
 // ---------------------------------------------------------------- prompt
@@ -120,13 +122,45 @@ class Runner {
     Object.assign(this, opts);
     this.depth = opts.depth || 0;
     this.allowed = new Set(this.session.allowedTools || []);
+    this.inbox = [];          // messages the user sent mid-run ("Send now"), delivered at the next step
+    this.finished = false;
   }
+
+  /** Queue a user message for delivery at the next step boundary. False when the run already ended. */
+  interject(msg) {
+    if (this.finished || this.depth > 0) return false;
+    this.inbox.push(msg);
+    this.emit({ kind: 'inbox', count: this.inbox.length });
+    return true;
+  }
+
+  /** Move pending interjections into the conversation. Returns how many were delivered. */
+  drainInbox() {
+    if (!this.inbox.length) return 0;
+    const msgs = this.inbox.splice(0);
+    const vision = this.model.vision !== false;
+    for (const m of msgs) {
+      const text = `[The user sent this while you were working — take it into account now]
+${m.text || ''}`;
+      const content = m.images && m.images.length && vision
+        ? [{ type: 'text', text }, ...m.images.map((url) => ({ type: 'image_url', image_url: { url } }))]
+        : text;
+      this.session.context.push({ role: 'user', content });
+      this.add({ type: 'user', text: m.text, images: m.images || [], interjected: true, qid: m.qid || null });
+    }
+    this.emit({ kind: 'inbox', count: 0 });
+    return msgs.length;
+  }
+
+  /** A hidden instruction for the model that is not shown as a user message. */
+  nudge(text) { this.session.context.push({ role: 'user', content: `[Vesper] ${text}`, _meta: { nudge: true } }); }
 
   get contextLength() { return this.model.contextLength || 128000; }
 
   add(item) {
     item.id = item.id || uid();
     item.ts = Date.now();
+    if (this.turnId && item.type !== 'user' && !item.turn) item.turn = this.turnId;
     if (this.depth === 0) this.session.transcript.push(item);
     this.emit({ kind: 'item:add', item });
     return item;
@@ -233,8 +267,15 @@ class Runner {
           },
           onUsage: (u) => runner.onUsage && runner.onUsage(u, subModel),
         });
-        const final = await child.run({ text: a.prompt });
-        return { output: final || '(subagent returned no text)', display: { subagent: true, model: subModel.id } };
+        let final;
+        try { final = await child.run({ text: a.prompt }); }
+        finally {
+          // Subagent spending counts toward this session's cost and budget.
+          const cu = child.session.usage;
+          for (const k of Object.keys(cu)) runner.session.usage[k] = (runner.session.usage[k] || 0) + (cu[k] || 0);
+          runner.emit({ kind: 'usage', usage: runner.session.usage, lastPromptTokens: runner.session.lastPromptTokens, contextLength: runner.contextLength });
+        }
+        return { output: final || '(subagent returned no text)', display: { subagent: true, model: subModel.id, cost: child.session.usage.cost, requests: child.session.usage.requests } };
       },
     };
   }
@@ -250,16 +291,26 @@ class Runner {
       : input.text;
     s.context.push({ role: 'user', content: userContent });
     if (this.depth === 0) {
+      this.turnId = null;
       this.turnId = this.add({ type: 'user', text: input.text, images: input.images || [] }).id;
       if (input.images && input.images.length && !vision) this.add({ type: 'notice', text: `${this.model.id} does not accept images, so the attachment was left out. Pick a vision model to send images.` });
     }
 
     let finalText = '';
-    const maxTurns = this.depth === 0 ? (this.config.maxTurns || 80) : 40;
+    // Long-running agents: no step cap unless the user set one (Settings → General, 0 = unlimited).
+    const maxTurns = this.depth === 0 && Number(this.config.maxTurns) > 0 ? Number(this.config.maxTurns) : Infinity;
     let retriedOverflow = false;
+    let emptyRetries = 0;
+    let continuations = 0;
+    this.loopSig = null; this.loopCount = 0;
 
-    for (let turn = 0; turn < maxTurns; turn++) {
+    for (let turn = 0; ; turn++) {
       if (this.signal && this.signal.aborted) break;
+      if (turn >= maxTurns) {
+        if (this.depth === 0) this.add({ type: 'notice', text: `Paused after ${maxTurns} steps (your step limit in Settings → General). Send "continue" to keep going.` });
+        break;
+      }
+      this.drainInbox();
       const budget = Number(this.config.sessionBudget) || 0;
       if (budget > 0 && (s.usage.cost || 0) >= budget) {
         if (this.depth === 0) this.add({ type: 'notice', text: `Session budget of $${budget.toFixed(2)} reached ($${s.usage.cost.toFixed(4)} spent). Raise or clear it in Settings → General to continue.` });
@@ -274,8 +325,10 @@ class Runner {
         model: this.model.id,
         messages: [{ role: 'system', content: sys }, ...prepareMessages(s.context, KEEP_IMAGES, vision)],
         tools: schemas(tools),
-        max_tokens: Math.min(this.model.maxOutput || 32000, this.config.maxOutputTokens || 32000),
       };
+      // 0 = let the provider decide (no artificial cap). Anthropic-style endpoints require a value.
+      const cap = Number(this.config.maxOutputTokens) || (this.provider.preset === 'anthropic' ? 32000 : 0);
+      if (cap) body.max_tokens = this.model.maxOutput ? Math.min(this.model.maxOutput, cap) : cap;
       const effort = this.depth === 0 ? s.effort : (s.effort || null);
       if (effort && this.model.reasoningEfforts && this.model.reasoningEfforts.includes(effort)) body.reasoning_effort = effort;
       if (this.provider.kind !== 'refuseless' && this.config.temperature != null) body.temperature = this.config.temperature;
@@ -342,12 +395,41 @@ class Runner {
       }
 
       if (!msg.tool_calls || !msg.tool_calls.length) {
-        if (result.finishReason === 'length' && this.depth === 0) this.add({ type: 'notice', text: 'The reply hit the output-token limit and was cut off. Say "continue" to resume.' });
+        // Output cap hit mid-answer: continue automatically instead of leaving a truncated reply.
+        if (result.finishReason === 'length' && continuations < 4) {
+          continuations++;
+          this.nudge('Your reply was cut off by the output limit. Continue exactly where you stopped; do not repeat anything.');
+          continue;
+        }
+        // Reasoning but no answer and no tool call (common with reasoning models that "plan" a step and stop):
+        // nudge it to actually act rather than ending the turn silently.
+        if (!msg.content && emptyRetries < 2 && !(this.signal && this.signal.aborted)) {
+          emptyRetries++;
+          this.nudge(msg.reasoning
+            ? 'You stopped after thinking without calling a tool or answering. Carry out the step you planned now (call the tool), or give your final answer.'
+            : 'Your last reply was empty. Continue the task: call a tool or give your final answer.');
+          continue;
+        }
+        // The user sent a message mid-run: keep going so the model sees it instead of ending the turn.
+        if (this.inbox.length) continue;
         break;
       }
-      await this.runTools(msg.tool_calls, tools);
+      emptyRetries = 0;
+      const results = await this.runTools(msg.tool_calls, tools);
       if (this.signal && this.signal.aborted) break;
+      // Loop detection: the same calls returning the same results over and over is not progress.
+      const sig = JSON.stringify(msg.tool_calls.map((c) => [c.function.name, c.function.arguments])) + '|' + (results || []).map((r) => String(r.content).slice(0, 2000)).join('|');
+      const isPoll = msg.tool_calls.every((c) => c.function.name === 'shell_output');
+      if (sig === this.loopSig && !isPoll) this.loopCount++; else { this.loopSig = sig; this.loopCount = 1; }
+      if (this.loopCount === LOOP_NUDGE) this.nudge('You have made the identical tool call(s) with identical results several times in a row. That is a loop. Change approach, or stop and report what is blocking you.');
+      if (this.loopCount >= LOOP_STOP) {
+        if (this.depth === 0) this.add({ type: 'notice', text: 'Stopped: the agent repeated the same tool call with the same result many times in a row. Send a message to steer it.' });
+        break;
+      }
     }
+    this.finished = true;
+    // Anything that arrived after the last step is handed back to the caller to send as a new turn.
+    this.leftover = this.inbox.splice(0);
     this.emit({ kind: 'status', busy: false });
     return finalText;
   }
@@ -462,12 +544,14 @@ class Runner {
       }
     }
     s.context.push(...results);
+    const ret = results;
     if (images.length) {
       s.context.push({ role: 'user', content: [
         { type: 'text', text: `[Images returned by tools: ${images.map((i) => i.from).join('; ')}]` },
         ...images.map((i) => ({ type: 'image_url', image_url: { url: i.url } })),
       ], _meta: { toolImages: true } });
     }
+    return ret;
   }
 
   // -------------------------------------------------------------- compaction
@@ -488,11 +572,11 @@ class Runner {
     for (let i = ctx.length - 1; i > 0; i--) {
       tailTokens += estTokens(textOf(ctx[i].content)) + estTokens(ctx[i].tool_calls || '');
       if (tailTokens > budget) break;
-      if (ctx[i].role === 'user' && !(ctx[i]._meta && ctx[i]._meta.toolImages)) cut = i;
+      if (ctx[i].role === 'user' && !ctx[i]._meta) cut = i;
     }
     if (cut >= ctx.length) {
       // No clean boundary inside budget: keep only the last user message onward.
-      for (let i = ctx.length - 1; i > 0; i--) if (ctx[i].role === 'user' && !(ctx[i]._meta && ctx[i]._meta.toolImages)) { cut = i; break; }
+      for (let i = ctx.length - 1; i > 0; i--) if (ctx[i].role === 'user' && !ctx[i]._meta) { cut = i; break; }
     }
     if (reason === 'manual') cut = ctx.length; // manual (idle): summarize everything
     const head = ctx.slice(0, cut);

@@ -35,7 +35,9 @@ contextBridge.exposeInMainWorld('vesper', {
   },
   agent: {
     send: (o) => call('agent:send', o),
+    interject: (o) => call('agent:interject', o),
     stop: (id) => call('agent:stop', id),
+    pending: () => call('agent:pending'),
     compact: (id, ins) => call('agent:compact', id, ins),
     reply: (o) => call('approval:reply', o),
     revert: (sid, itemId) => call('agent:revert', sid, itemId),

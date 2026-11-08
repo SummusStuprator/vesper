@@ -138,6 +138,72 @@ const ok = (name) => { passed++; console.log('  ✓', name); };
   assert.ok(compacted && session.context[0].content.includes('Summary')); ok('manual compaction replaces history with summary');
 
   server.close();
+
+  // ---- scripted provider: each request is answered by the next step of a script
+  let script = [];
+  let bodies = [];
+  const srv2 = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', async () => {
+      const b = JSON.parse(body); bodies.push(b);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      const step = script.length > 1 ? script.shift() : script[0];
+      for (const ev of await step(b)) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+      res.end('data: [DONE]\n\n');
+    });
+  });
+  await new Promise((r) => srv2.listen(0, r));
+  const prov2 = Object.assign({}, provider, { baseUrl: `http://127.0.0.1:${srv2.address().port}/v1` });
+  const U = { prompt_tokens: 100, completion_tokens: 5 };
+  const say = (text, finish = 'stop') => () => [{ choices: [{ delta: { content: text } }] }, { choices: [{ delta: {}, finish_reason: finish }], usage: U }];
+  const think = (text) => () => [{ choices: [{ delta: { reasoning_content: text } }] }, { choices: [{ delta: {}, finish_reason: 'stop' }], usage: U }];
+  const callTool = (name, args, id = 'x') => () => [{ choices: [{ delta: { tool_calls: [{ index: 0, id, function: { name, arguments: JSON.stringify(args) } }] } }] }, { choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage: U }];
+  const fresh = () => ({ id: 's2', workspace: ws, context: [], transcript: [], usage: { input: 0, cached: 0, output: 0, cost: 0, requests: 0 }, todos: [], allowedTools: [] });
+  const mk = (sess, extra = {}) => new Runner(Object.assign({ session: sess, config: Object.assign({}, config, { maxTurns: 0 }), provider: prov2, model, emit: () => {}, approve: async () => ({ decision: 'once' }), signal: new AbortController().signal }, extra));
+
+  // Reasoning with no answer and no tool call → nudged to act instead of ending silently.
+  script = [think('Let me list the files first.'), callTool('list_dir', { path: '.' }), say('Found src/.')];
+  bodies = [];
+  let s2 = fresh();
+  assert.strictEqual(await mk(s2).run({ text: 'look around' }), 'Found src/.');
+  assert.ok(bodies[1].messages.some((m) => m.role === 'user' && String(m.content).includes('stopped after thinking'))); ok('empty reply after reasoning → nudged to continue');
+
+  // "Send now": a message delivered mid-run reaches the model at the next step and joins the turn.
+  s2 = fresh();
+  const rj = mk(s2);
+  script = [async () => { rj.interject({ text: 'also check README', qid: 'q1' }); return callTool('list_dir', { path: '.' })(); }, say('Done, README checked too.')];
+  bodies = [];
+  await rj.run({ text: "list files" });
+  assert.ok(bodies[1].messages.some((m) => m.role === 'user' && String(m.content).includes('also check README')));
+  assert.ok(s2.transcript.some((x) => x.type === 'user' && x.interjected && x.qid === 'q1')); ok('send-now message delivered at the next step');
+  assert.strictEqual(rj.interject({ text: "late" }), false); ok('interject refused after the run ended (goes to the queue instead)');
+
+  // Same call, same result, over and over → loop detector stops the run (there is no step cap).
+  s2 = fresh();
+  script = [callTool('list_dir', { path: '.' })];
+  bodies = [];
+  await mk(s2).run({ text: 'loop forever' });
+  assert.ok(bodies.length >= 8 && bodies.length <= 9, `requests ${bodies.length}`);
+  assert.ok(s2.transcript.some((x) => x.type === 'notice' && /repeated the same tool call/.test(x.text))); ok('loop detector stops identical repeated calls');
+
+  // Output limit mid-answer → continued automatically.
+  s2 = fresh();
+  script = [say('Part one…', 'length'), say('Part two.')];
+  bodies = [];
+  assert.strictEqual(await mk(s2).run({ text: 'write a lot' }), 'Part two.');
+  assert.ok(bodies[1].messages.some((m) => String(m.content).includes('cut off by the output limit'))); ok('truncated reply auto-continued');
+  assert.ok(!('max_tokens' in bodies[0])); ok('no output cap sent by default');
+
+  // A long run is not cut off by a step limit.
+  s2 = fresh();
+  let n = 0;
+  script = [() => (++n < 120 ? callTool('list_dir', { path: n % 2 ? '.' : 'src' }, `c${n}`)() : say('finished')())];
+  bodies = [];
+  assert.strictEqual(await mk(s2).run({ text: 'long task' }), 'finished');
+  assert.ok(bodies.length >= 120); ok(`unlimited steps (${bodies.length} model calls in one turn)`);
+  srv2.close();
+
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\n${passed} checks passed.`);
 })().catch((e) => { console.error('\n✗', e); process.exit(1); });

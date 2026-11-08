@@ -14,7 +14,7 @@ const PRESETS = [
   ['custom', 'Custom', ''],
 ];
 const KEY_RE = /^abl_[A-Za-z0-9_\-]{12,}$/;
-const PREFERRED = ['glm-5.3-abliterated', 'deepseek-v4.1-flash-abliterated', 'glm-5.3-flash-abliterated'];
+const PREFERRED = ['deepseek-v4.1-flash-abliterated', 'glm-5.3-abliterated', 'glm-5.3-flash-abliterated']; // cheap + built for agents first
 
 export function mountSetup(root, cfg, onDone) {
   const st = { step: 'welcome', key: '', validating: false, valid: null, credits: null, error: '', models: [], provider: null, model: null, effort: null, mode: cfg.permissionMode || 'ask', other: { preset: 'openai', baseUrl: PRESETS[0][2], apiKey: '', name: '', modelId: '' } };
@@ -80,9 +80,9 @@ export function mountSetup(root, cfg, onDone) {
         h('table', { class: 'data' },
           h('thead', null, h('tr', null, ['Model', 'Context', 'Input', 'Cached', 'Output', ''].map((t) => h('th', null, t)))),
           h('tbody', null, lineup.map((m) => h('tr', null,
-            h('td', { class: 'nm' }, m.id),
+            h('td', { class: 'nm' }, m.id, m.blurb ? h('div', { class: 'bl' }, m.blurb) : null),
             h('td', { class: 'mono' }, m.contextLength ? fmtTokShort(m.contextLength) : '—'),
-            h('td', { class: 'mono' }, m.pricing.input ? `$${m.pricing.input}` : 'free'),
+            h('td', { class: 'mono', title: m.priceEstimate ? 'Estimated price' : '' }, m.pricing.input ? `${m.priceEstimate ? '~' : ''}$${m.pricing.input}` : 'free'),
             h('td', { class: 'mono' }, `$${m.pricing.cachedInput ?? m.pricing.input}`),
             h('td', { class: 'mono' }, m.pricing.output ? `$${m.pricing.output}` : 'free'),
             h('td', null, h('div', { class: 'row', style: { gap: '4px' } }, m.abliterated ? h('span', { class: 'tag red' }, 'abliterated') : h('span', { class: 'tag' }, 'standard'), m.vision ? h('span', { class: 'tag' }, 'vision') : null))))))) : null), true);
@@ -248,7 +248,7 @@ export function mountSetup(root, cfg, onDone) {
       h('div', { class: 'model-grid' }, st.models.map((m) => h('button', {
         class: `model-card ${m.id === st.model ? 'on' : ''}`,
         onclick: () => { st.model = m.id; st.effort = m.reasoningDefault || null; render(); },
-      }, h('div', { class: 'nm' }, m.id), h('div', { class: 'pr' }, fmtPrice(m.pricing)), h('div', { class: 'tags' }, modelTags(m))))),
+      }, h('div', { class: 'nm' }, m.id), h('div', { class: 'pr' }, fmtPrice(m.pricing), m.priceEstimate ? ' (est.)' : ''), m.blurb ? h('div', { class: 'bl' }, m.blurb) : null, h('div', { class: 'tags' }, modelTags(m))))),
       h('div', { class: 'stack', style: { marginTop: '24px' } },
         sel && sel.reasoningEfforts && sel.reasoningEfforts.length ? h('div', { class: 'set-row' },
           h('div', { class: 'lbl' }, h('b', null, 'Reasoning effort'), h('span', null, 'How long the model thinks before answering.')),

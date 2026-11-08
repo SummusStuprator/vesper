@@ -22,6 +22,8 @@ const catalogs = new Map();        // providerId -> { models, live, error, at }
 const runs = new Map();            // sessionId -> { controller, runner }
 const sessions = new Map();        // sessionId -> session (loaded)
 const approvals = new Map();       // requestId -> resolve
+const pendingEvents = new Map();   // requestId -> the approval/question event, replayed if the UI reloads
+const deleted = new Set();         // sessions deleted while a run was still finishing: never re-save them
 let hiddenForComputer = false;     // window minimized so screenshots show the desktop
 
 // ------------------------------------------------------------------ helpers
@@ -57,18 +59,66 @@ async function resolveModel(providerId, modelId) {
   return c.models.find((m) => m.id === modelId) || { id: modelId, providerId, pricing: null };
 }
 
-function persistSession(s) { try { store.saveSession(s); } catch (e) { console.error('save failed', e); } }
+function persistSession(s) { if (deleted.has(s.id)) return; try { store.saveSession(s); } catch (e) { console.error('save failed', e); } }
+
+// Vesper was closed (or crashed) mid-run: settle what was in flight so the session can continue cleanly.
+function recoverSession(s) {
+  let touched = false;
+  for (const it of s.transcript || []) {
+    if (it.streaming) { it.streaming = false; it.interrupted = true; touched = true; }
+    if (it.type === 'tool' && ['pending', 'running', 'awaiting'].includes(it.status)) { it.status = 'error'; it.output = 'Interrupted: Vesper was closed while this was running. Its outcome is unknown.'; touched = true; }
+  }
+  // Every assistant tool call needs a tool result, or the provider rejects the next request.
+  const ctx = s.context || [];
+  const out = [];
+  for (let i = 0; i < ctx.length; i++) {
+    const m = ctx[i];
+    out.push(m);
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const answered = new Set();
+      let j = i + 1;
+      while (j < ctx.length && ctx[j].role === 'tool') { answered.add(ctx[j].tool_call_id); j++; }
+      const missing = m.tool_calls.filter((c) => !answered.has(c.id));
+      if (missing.length) {
+        // Insert results right after the existing ones for this call batch.
+        const existing = ctx.slice(i + 1, j);
+        out.push(...existing);
+        for (const c of missing) out.push({ role: 'tool', tool_call_id: c.id, content: '[Interrupted: Vesper was closed before this finished. The outcome is unknown; check the current state before retrying.]' });
+        i = j - 1;
+        touched = true;
+      }
+    }
+  }
+  if (touched) {
+    s.context = out;
+    if ((s.transcript || []).length && !s.transcript.some((x) => x.recovered)) {
+      s.transcript.push({ id: crypto.randomBytes(6).toString('hex'), type: 'notice', ts: Date.now(), recovered: true, text: 'Vesper was closed during the last run. Anything in progress was stopped; send "continue" to pick up where it left off.' });
+    }
+  }
+}
+
+// A workspace must be an existing folder; resolves ~ and normalises separators.
+function checkWorkspace(dir) {
+  let d = String(dir || '').trim();
+  if (!d) return app.getPath('home');
+  if (d === '~' || /^~[\\/]/.test(d)) d =path.join(app.getPath('home'), d.slice(1));
+  d = path.resolve(d);
+  let st = null;
+  try { st = fs.statSync(d); } catch {}
+  if (!st || !st.isDirectory()) throw new Error(`Folder not found: ${d}`);
+  return d;
+}
 
 function getSession(id) {
   if (sessions.has(id)) return sessions.get(id);
   const s = store.loadSession(id);
-  if (s) sessions.set(id, s);
+  if (s) { recoverSession(s); sessions.set(id, s); }
   return s;
 }
 
 function newSession(workspace, opts = {}) {
   const s = {
-    id: newId(), title: opts.incognito ? 'Incognito session' : 'New session', workspace: workspace || app.getPath('home'),
+    id: newId(), title: opts.incognito ? 'Incognito session' : 'New session', workspace: checkWorkspace(workspace),
     incognito: !!opts.incognito,
     createdAt: Date.now(), updatedAt: Date.now(),
     providerId: config.activeProviderId, model: config.activeModel, effort: config.effort,
@@ -100,15 +150,19 @@ function makeRunner(s, model, controller) {
     approve: ({ item, depth, reason, guard }) => new Promise((resolve) => {
       const requestId = newId();
       approvals.set(requestId, resolve);
-      send('agent:event', { sessionId: s.id, kind: 'approval', requestId, item: { id: item.id, name: item.name, args: item.args, summary: item.summary, kind: item.kind }, depth, reason, guard });
-      controller.signal.addEventListener('abort', () => { if (approvals.has(requestId)) { approvals.delete(requestId); resolve({ decision: 'deny', feedback: 'Run was stopped.' }); } });
+      const ev = { sessionId: s.id, kind: 'approval', requestId, item: { id: item.id, name: item.name, args: item.args, summary: item.summary, kind: item.kind }, depth, reason, guard };
+      pendingEvents.set(requestId, ev);
+      send('agent:event', ev);
+      controller.signal.addEventListener('abort', () => { pendingEvents.delete(requestId); if (approvals.has(requestId)) { approvals.delete(requestId); resolve({ decision: 'deny', feedback: 'Run was stopped.' }); } });
       attention('Vesper needs your approval', item.summary || item.name);
     }),
     ask: ({ itemId, question, options }) => new Promise((resolve) => {
       const requestId = newId();
       approvals.set(requestId, resolve);
-      send('agent:event', { sessionId: s.id, kind: 'question', requestId, itemId, question, options });
-      controller.signal.addEventListener('abort', () => { if (approvals.has(requestId)) { approvals.delete(requestId); resolve({ answer: '' }); } });
+      const ev = { sessionId: s.id, kind: 'question', requestId, itemId, question, options };
+      pendingEvents.set(requestId, ev);
+      send('agent:event', ev);
+      controller.signal.addEventListener('abort', () => { pendingEvents.delete(requestId); if (approvals.has(requestId)) { approvals.delete(requestId); resolve({ answer: '' }); } });
       attention('Vesper has a question', question);
     }),
     onUsage: (u, m) => {
@@ -209,6 +263,9 @@ function registerIpc() {
   handle('setup:complete', (o) => {
     Object.assign(config, { setupComplete: true, activeProviderId: o.providerId, activeModel: o.model, effort: o.effort || null });
     if (o.permissionMode) config.permissionMode = o.permissionMode;
+    // On Refuseless, subagents default to the fastest, cheapest model (they mostly search and read).
+    const p = providerById(o.providerId);
+    if (p && p.kind === 'refuseless' && !config.subagentModel && o.model !== 'deepseek-v4.1-flash-fast') config.subagentModel = 'deepseek-v4.1-flash-fast';
     store.saveConfig(config);
     destroySignup();
     return publicConfig();
@@ -232,10 +289,11 @@ function registerIpc() {
   handle('sessions:list', () => store.listSessions().map((x) => Object.assign(x, { running: runs.has(x.id) })));
   handle('sessions:create', (ws, opts) => strip(newSession(ws, opts || {})));
   handle('sessions:load', (id) => { const s = getSession(id); if (!s) throw new Error('Session not found'); return strip(s); });
-  handle('sessions:delete', (id) => { stopRun(id); sessions.delete(id); store.deleteSession(id); return true; });
+  handle('sessions:delete', (id) => { if (runs.has(id)) deleted.add(id); stopRun(id); sessions.delete(id); store.deleteSession(id); return true; });
   handle('sessions:rename', (id, title) => { const s = getSession(id); s.title = title; persistSession(s); return true; });
   handle('sessions:update', (id, patch) => {
     const s = getSession(id);
+    if ('workspace' in patch) patch.workspace = checkWorkspace(patch.workspace);
     for (const k of ['providerId', 'model', 'effort', 'workspace']) if (k in patch) s[k] = patch[k];
     if (patch.workspace) rememberWorkspace(patch.workspace);
     if (patch.model) { config.activeModel = patch.model; config.activeProviderId = s.providerId; if ('effort' in patch) config.effort = patch.effort; store.saveConfig(config); }
@@ -267,20 +325,32 @@ function registerIpc() {
     runs.set(sessionId, { controller, runner });
     send('sessions:changed', null);
     (async () => {
+      let failed = false;
       try { await runner.run({ text, images }); }
-      catch (e) { if (!controller.signal.aborted) console.error('[run]', e.message); }
+      catch (e) { failed = true; if (!controller.signal.aborted) console.error('[run]', e.message); }
       finally {
         runs.delete(sessionId);
         persistSession(s);
         if (hiddenForComputer && win) { hiddenForComputer = false; win.restore(); }
-        send('agent:event', { sessionId, kind: 'done', usage: s.usage, todos: s.todos, contextMessages: s.context.length });
+        const stopped = controller.signal.aborted;
+        // "Send now" messages that arrived after the last step go back to the renderer's queue.
+        const leftover = (runner.leftover || []).map((m) => ({ qid: m.qid, text: m.text, images: m.images || [] }));
+        send('agent:event', { sessionId, kind: 'done', stopped, failed, leftover, usage: s.usage, todos: s.todos, contextMessages: s.context.length });
         send('sessions:changed', null);
-        attention('Vesper finished', s.title);
+        if (!stopped) attention(failed ? 'Vesper stopped with an error' : 'Vesper finished', s.title);
       }
     })();
     return true;
   });
+  // Deliver a message to a running agent at its next step (after the current model call / tool batch).
+  handle('agent:interject', ({ sessionId, text, images, qid }) => {
+    const r = runs.get(sessionId);
+    if (!r || !r.runner || !r.runner.interject) return false;
+    return r.runner.interject({ text: String(text || ''), images: Array.isArray(images) ? images.slice(0, 8) : [], qid });
+  });
   handle('agent:stop', (sessionId) => { stopRun(sessionId); return true; });
+  // What the UI needs to rebuild after a reload: which sessions are running and what they wait on.
+  handle('agent:pending', () => ({ running: [...runs.keys()], events: [...pendingEvents.values()] }));
   handle('agent:compact', async (sessionId, instructions) => {
     const s = getSession(sessionId);
     if (runs.has(sessionId)) throw new Error('Wait for the current run to finish.');
@@ -295,6 +365,7 @@ function registerIpc() {
   });
   handle('approval:reply', ({ requestId, decision, feedback, answer }) => {
     const r = approvals.get(requestId);
+    pendingEvents.delete(requestId);
     if (r) { approvals.delete(requestId); r({ decision, feedback, answer }); }
     return true;
   });
@@ -402,7 +473,7 @@ function registerIpc() {
     if (cmd === 'back' && wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
     if (cmd === 'reload') wc.reload();
     if (cmd === 'external') shell.openExternal(wc.getURL());
-    if (cmd === 'hide') signupView.setVisible(false);
+    if (cmd === 'hide') { signupView.setVisible(false); refocusMain(); }
     if (cmd === 'show') signupView.setVisible(true);
     return true;
   });
@@ -460,6 +531,14 @@ function destroySignup() {
   if (!signupView) return;
   try { win.contentView.removeChildView(signupView); signupView.webContents.close(); } catch {}
   signupView = null;
+  refocusMain();
+}
+
+// A removed or hidden WebContentsView can keep keyboard focus, which leaves the app's own inputs
+// unable to receive typing. Always hand focus back to the main UI explicitly.
+function refocusMain() {
+  if (!win || win.isDestroyed()) return;
+  setTimeout(() => { try { if (!signupView || !signupView.getVisible()) win.webContents.focus(); } catch {} }, 0);
 }
 
 ipcMain.on('signup:key-found', (e, key) => {
@@ -471,9 +550,32 @@ ipcMain.on('signup:key-found', (e, key) => {
 
 // ------------------------------------------------------------------ app lifecycle
 
+const winStateFile = () => path.join(app.getPath('userData'), 'vesper', 'window.json');
+function loadWinState() {
+  try {
+    const st = JSON.parse(fs.readFileSync(winStateFile(), 'utf8'));
+    const { screen } = require('electron');
+    // Only restore a position that is still on a connected display.
+    const visible = screen.getAllDisplays().some((d) => {
+      const a = d.workArea;
+      return st.x >= a.x - 50 && st.y >= a.y - 50 && st.x + 200 <= a.x + a.width && st.y + 100 <= a.y + a.height;
+    });
+    return visible ? st : { width: st.width, height: st.height, maximized: st.maximized };
+  } catch { return {}; }
+}
+function saveWinState() {
+  if (!win || win.isDestroyed()) return;
+  try {
+    const b = win.getNormalBounds();
+    fs.writeFileSync(winStateFile(), JSON.stringify({ x: b.x, y: b.y, width: b.width, height: b.height, maximized: win.isMaximized() }));
+  } catch {}
+}
+
 function createWindow() {
+  const ws = loadWinState();
   win = new BrowserWindow({
-    width: 1360, height: 880, minWidth: 940, minHeight: 600,
+    width: ws.width || 1360, height: ws.height || 880, minWidth: 940, minHeight: 600,
+    ...(ws.x != null ? { x: ws.x, y: ws.y } : {}),
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0f0f10' : '#f6f5f1',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     titleBarOverlay: process.platform === 'darwin' ? false : { color: '#00000000', symbolColor: nativeTheme.shouldUseDarkColors ? '#a8a6a0' : '#55534e', height: 40 },
@@ -482,9 +584,23 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true,
       spellcheck: true, webviewTag: false, navigateOnDragDrop: false, safeDialogs: true,
+      backgroundThrottling: false, // keep streaming smoothly while minimized or behind other windows
     },
   });
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => { if (ws.maximized) win.maximize(); win.show(); });
+  for (const ev of ['resize', 'move', 'maximize', 'unmaximize']) win.on(ev, () => { clearTimeout(win._saveT); win._saveT = setTimeout(saveWinState, 400); });
+  win.on('close', saveWinState);
+  // Right-click: cut/copy/paste/select all and spelling suggestions (Electron has no default menu).
+  win.webContents.on('context-menu', (_e, p) => {
+    const items = [];
+    for (const w of (p.dictionarySuggestions || []).slice(0, 5)) items.push({ label: w, click: () => win.webContents.replaceMisspelling(w) });
+    if (p.misspelledWord) items.push({ label: 'Add to dictionary', click: () => win.webContents.session.addWordToSpellCheckerDictionary(p.misspelledWord) }, { type: 'separator' });
+    if (p.isEditable) items.push({ role: 'cut', enabled: p.editFlags.canCut }, { role: 'copy', enabled: p.editFlags.canCopy }, { role: 'paste', enabled: p.editFlags.canPaste }, { type: 'separator' }, { role: 'selectAll' });
+    else if (p.selectionText && p.selectionText.trim()) items.push({ role: 'copy' });
+    if (p.linkURL && /^https?:/.test(p.linkURL)) items.push({ type: 'separator' }, { label: 'Open link in browser', click: () => shell.openExternal(p.linkURL) }, { label: 'Copy link', click: () => require('electron').clipboard.writeText(p.linkURL) });
+    if (items.length) Menu.buildFromTemplate(items).popup({ window: win });
+  });
+  win.on('focus', () => { if (!signupView || !signupView.getVisible()) win.webContents.focus(); });
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });
   win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith('file:')) { e.preventDefault(); shell.openExternal(url); } });
@@ -518,6 +634,14 @@ function harden() {
     }
   });
 }
+
+// One Vesper per profile: a second launch focuses the existing window instead of fighting over the same data.
+if (!app.requestSingleInstanceLock()) app.exit(0);
+app.on('second-instance', () => {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show(); win.focus();
+});
 
 app.whenReady().then(() => {
   store.init(path.join(app.getPath('userData'), 'vesper'));

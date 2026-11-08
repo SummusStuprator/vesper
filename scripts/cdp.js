@@ -2,7 +2,8 @@
 //   node scripts/cdp.js eval "<expression>"
 //   node scripts/cdp.js shot out.png
 const fs = require('fs');
-const [cmd, arg] = process.argv.slice(2);
+const [cmd, rawArg] = process.argv.slice(2);
+const arg = rawArg && rawArg.startsWith('@') ? fs.readFileSync(rawArg.slice(1), 'utf8') : rawArg; // @file = read the argument from a file
 const port = process.env.CDP_PORT || 9333;
 
 (async () => {
@@ -17,6 +18,22 @@ const port = process.env.CDP_PORT || 9333;
   if (cmd === 'eval') {
     const r = await call('Runtime.evaluate', { expression: arg, awaitPromise: true, returnByValue: true });
     console.log(JSON.stringify(r.result.result ? r.result.result.value ?? r.result.result.description : r.result, null, 2));
+  } else if (cmd === 'type') {
+    // Real keyboard input into whatever has focus (unlike eval, this goes through the input pipeline).
+    await call('Page.bringToFront'); await call('Emulation.setFocusEmulationEnabled', { enabled: true });
+    for (const ch of arg) {
+      await call('Input.dispatchKeyEvent', { type: 'keyDown', key: ch, text: ch, unmodifiedText: ch });
+      await call('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
+    }
+    console.log('typed', arg.length);
+  } else if (cmd === 'key') {
+    const map = { Enter: 13, Escape: 27, Tab: 9, ArrowUp: 38, ArrowDown: 40, Backspace: 8 };
+    for (const type of ['rawKeyDown', 'keyUp']) await call('Input.dispatchKeyEvent', { type, key: arg, code: arg, windowsVirtualKeyCode: map[arg] || 0, ...(arg === 'Enter' && type === 'rawKeyDown' ? { text: String.fromCharCode(13) } : {}) });
+    console.log('key', arg);
+  } else if (cmd === 'click') {
+    const [x, y] = arg.split(',').map(Number);
+    for (const type of ['mousePressed', 'mouseReleased']) await call('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+    console.log('clicked', x, y);
   } else if (cmd === 'reload') {
     await call('Network.enable'); await call('Network.setCacheDisabled', { cacheDisabled: true });
     await call('Page.reload', { ignoreCache: true });

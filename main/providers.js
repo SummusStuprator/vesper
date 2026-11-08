@@ -9,13 +9,22 @@ const REFUSELESS = {
 
 // Fallback lineup (USD per 1M tokens) used when the live catalog is unreachable.
 // Source: docs.refuseless.com/api/models + published pricing (Oct 2026).
+// The public /v1/models list has ids, context, vision, abliteration and reasoning efforts but no prices,
+// so prices live here (USD per 1M tokens: input / cached input / output). Kept current by hand;
+// users can override any price in Settings → Models. `blurb` and `role` drive model guidance in the UI.
 const REFUSELESS_FALLBACK = [
-  { id: 'glm-5.3-abliterated', contextLength: 1048576, maxOutput: 131072, pricing: { input: 1.25, cachedInput: 0.25, output: 2.25 }, reasoningEfforts: ['low', 'high', 'max'], vision: false, abliterated: true },
-  { id: 'glm-5.3-flash-abliterated', contextLength: 1048576, maxOutput: 131072, pricing: { input: 0.25, cachedInput: 0.15, output: 0.8 }, reasoningEfforts: ['low', 'high', 'max'], vision: true, abliterated: true },
-  { id: 'deepseek-v4.1-flash-abliterated', contextLength: 1048576, maxOutput: 130000, pricing: { input: 0.22, cachedInput: 0.045, output: 0.75 }, reasoningEfforts: ['off', 'low', 'high', 'max'], vision: false, abliterated: true },
-  { id: 'deepseek-v4.1-flash-fast', contextLength: 1048576, maxOutput: 262144, pricing: { input: 0.05, cachedInput: 0.003, output: 0.15 }, reasoningEfforts: ['off', 'low', 'high', 'max'], vision: false, abliterated: false },
-  { id: 'minimax-m3.1-flash', contextLength: 1048576, maxOutput: 512000, pricing: { input: 0.05, cachedInput: 0.002, output: 0.25 }, reasoningEfforts: ['low', 'high', 'max'], vision: false, abliterated: false },
-  { id: 'deepseek-v4.1-flash-abliterated-free', contextLength: 524288, maxOutput: 65536, pricing: { input: 0, cachedInput: 0, output: 0 }, reasoningEfforts: ['off', 'low', 'high', 'max'], vision: false, abliterated: true },
+  { id: 'glm-5.3-abliterated', contextLength: 1048576, maxOutput: 131072, pricing: { input: 1.25, cachedInput: 0.25, output: 2.25 }, reasoningEfforts: ['low', 'high', 'max'], vision: false, abliterated: true,
+    role: 'flagship', blurb: 'Strongest abliterated model. Hard, long and agentic tasks.' },
+  { id: 'kimi-k3.1-pro', contextLength: 1048576, maxOutput: 131072, pricing: { input: 0.25, cachedInput: 0.15, output: 2.5 }, priceEstimate: true, reasoningEfforts: ['low', 'high', 'max'], vision: true, abliterated: false,
+    role: 'frontier', blurb: 'Frontier open model with vision. Original weights (abliterated version in progress).' },
+  { id: 'glm-5.3-flash-abliterated', contextLength: 1048576, maxOutput: 131072, pricing: { input: 0.25, cachedInput: 0.15, output: 0.8 }, reasoningEfforts: ['low', 'high', 'max'], vision: true, abliterated: true,
+    role: 'everyday', blurb: 'Everyday coding at a fraction of the flagship price. Sees images.' },
+  { id: 'deepseek-v4.1-flash-abliterated', contextLength: 1048576, maxOutput: 131072, pricing: { input: 0.22, cachedInput: 0.045, output: 0.75 }, reasoningEfforts: ['off', 'low', 'high', 'max'], vision: true, abliterated: true,
+    role: 'agents', blurb: 'Built for coding agents. Very cheap cached input for long sessions.' },
+  { id: 'deepseek-v4.1-flash-fast', contextLength: 1048576, maxOutput: 262144, pricing: { input: 0.05, cachedInput: 0.003, output: 0.15 }, reasoningEfforts: ['off', 'low', 'high', 'max'], vision: true, abliterated: false,
+    role: 'fast', blurb: 'Fastest and cheapest. Great for subagents and bulk work.' },
+  { id: 'minimax-m3.1-flash', contextLength: 1048576, maxOutput: 512000, pricing: { input: 0.05, cachedInput: 0.002, output: 0.25 }, reasoningEfforts: ['low', 'high', 'max'], vision: true, abliterated: false,
+    role: 'long', blurb: 'Huge output budget and near-free cached input. Long generations.' },
 ];
 
 // Presets for "other providers". All OpenAI-compatible.
@@ -108,6 +117,9 @@ function normalizeModel(m, provider) {
     reasoningDefault: m.reasoning_default || m.reasoningDefault || null,
     abliterated: m.abliterated,
     pricing,
+    priceEstimate: m.priceEstimate || undefined,
+    role: m.role || undefined,
+    blurb: m.blurb || undefined,
   };
 }
 

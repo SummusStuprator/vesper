@@ -1,9 +1,9 @@
 // Settings modal: general, providers, models & pricing, tools, MCP, usage.
-import { h, api, icon, toast, fmtUsd, fmtTok, modelTags, modeLadder, rlLogo, relTime } from './lib.js';
+import { h, api, icon, toast, fmtUsd, fmtTok, modelTags, modeLadder, relTime } from './lib.js';
 
 const SECTIONS = [
   ['general', 'General', 'settings'],
-  ['refuseless', 'Refuseless', 'coins'],
+  ['refuseless', 'Account & credits', 'coins'],
   ['security', 'Privacy & security', 'shield'],
   ['providers', 'Providers', 'plug'],
   ['models', 'Models & pricing', 'sparkle'],
@@ -55,10 +55,10 @@ export function openSettings(app, start = 'general') {
       row('Compact threshold', 'Share of the context window that triggers auto-compaction.',
         h('select', { class: 'select', style: { width: '120px' }, onchange: (e) => save({ compactThreshold: Number(e.target.value) }) },
           [0.6, 0.7, 0.8, 0.9].map((v) => h('option', { value: v, selected: c.compactThreshold === v }, `${v * 100}%`)))),
-      row('Max agent steps', 'Upper bound on model calls per message.',
-        h('input', { class: 'input', type: 'number', min: 5, max: 500, value: c.maxTurns, style: { width: '100px' }, onchange: (e) => save({ maxTurns: Number(e.target.value) || 80 }) })),
-      row('Max output tokens', 'Per response. Lower values also reduce how much credit each request holds.',
-        h('input', { class: 'input', type: 'number', min: 1024, max: 512000, value: c.maxOutputTokens || 32000, style: { width: '120px' }, onchange: (e) => save({ maxOutputTokens: Number(e.target.value) || 32000 }) })),
+      row('Step limit', 'Model calls per message before pausing. 0 = unlimited, for long-running agents (a loop detector still stops runs that are stuck).',
+        h('input', { class: 'input', type: 'number', min: 0, max: 100000, value: c.maxTurns || 0, style: { width: '100px' }, onchange: (e) => save({ maxTurns: Math.max(0, Number(e.target.value) || 0) }) })),
+      row('Max output tokens', 'Per response. 0 = no cap (provider default). Hosted providers hold credit for the maximum while a request runs, so a cap lowers that hold.',
+        h('input', { class: 'input', type: 'number', min: 0, max: 512000, value: c.maxOutputTokens || 0, style: { width: '120px' }, onchange: (e) => save({ maxOutputTokens: Math.max(0, Number(e.target.value) || 0) }) })),
       h('div', { class: 'field', style: { marginTop: '18px' } },
         h('label', null, 'Custom instructions'),
         h('textarea', { class: 'input', rows: 6, placeholder: 'Added to every session, e.g. “Prefer TypeScript. Always run the tests before finishing.”', value: c.systemPromptExtra || '', onchange: (e) => save({ systemPromptExtra: e.target.value }) }),
@@ -74,8 +74,7 @@ export function openSettings(app, start = 'general') {
     const cat = app.catalogs.find((x) => x.kind === 'refuseless');
     const keyInput = h('input', { class: 'input mono', type: 'password', placeholder: rl && rl.hasKey ? `${rl.keyMask} — paste a new key to replace` : 'abl_…' });
     return h('div', null,
-      h('div', { class: 'row', style: { marginBottom: '10px' } }, rlLogo(30)),
-      h('h2', null, 'Refuseless account'),
+      h('h2', null, 'Account & credits'),
       h('p', { class: 'sub' }, 'Hosted open-weight models with refusal behaviour removed from the weights. OpenAI-compatible, billed per token.'),
       h('div', { class: 'grid3' },
         h('div', { class: 'card red' }, h('div', { class: 'label' }, 'Available'), h('div', { class: 'big-num', style: { marginTop: '8px' } }, credits ? fmtUsd(credits.available, 2) : '—'),
@@ -87,7 +86,7 @@ export function openSettings(app, start = 'general') {
       h('div', { class: 'row', style: { marginTop: '14px', gap: '8px' } },
         h('button', { class: 'btn rl', onclick: () => api.open(c.referral) }, icon('coins', 'sm'), 'Top up credits'),
         h('button', { class: 'btn', onclick: () => api.open(c.referral) }, icon('key', 'sm'), 'Manage API keys'),
-        h('button', { class: 'btn ghost', onclick: () => api.open('https://docs.refuseless.com') }, icon('external', 'sm'), 'API docs')),
+        h('button', { class: 'btn ghost', onclick: () => api.open('https://refuseless.com/docs') }, icon('external', 'sm'), 'API docs')),
       h('h3', null, rl ? 'Replace key' : 'Add your key'),
       h('div', { class: 'row' }, keyInput, h('button', { class: 'btn primary', onclick: async () => {
         const k = keyInput.value.trim();

@@ -1,18 +1,33 @@
 {
   "name": "vesper",
   "productName": "Vesper",
-  "version": "0.1.0",
-  "description": "A general-purpose coding agent harness — files, shell, web, subagents, computer use, compaction, pricing.",
+  "version": "0.2.0",
+  "description": "A desktop coding agent built for Refuseless and any OpenAI-compatible provider: files, shell, web, subagents, computer use, compaction, live cost tracking.",
+  "author": "SummusStuprator",
+  "license": "MIT",
+  "homepage": "https://refuseless.com/?ref=dwqxpimh",
+  "keywords": [
+    "coding-agent",
+    "ai",
+    "llm",
+    "electron",
+    "refuseless",
+    "agent",
+    "desktop"
+  ],
   "main": "main/main.js",
   "type": "commonjs",
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
     "check": "node scripts/selftest.js",
+    "icons": "electron scripts/make-icons.js",
     "shortcut": "electron scripts/shortcut.js",
-    "icons": "electron scripts/make-icons.js"
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux --publish never",
+    "dist": "electron-builder --publish never"
   },
-  "license": "MIT",
   "dependencies": {
     "@fontsource-variable/inter": "^5.1.0",
     "@fontsource-variable/jetbrains-mono": "^5.1.0",
@@ -21,6 +36,94 @@
     "marked": "^14.1.0"
   },
   "devDependencies": {
-    "electron": "^33.2.0"
+    "electron": "44.9.3",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.vesper.app",
+    "productName": "Vesper",
+    "copyright": "Copyright © 2026 SummusStuprator",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main/**",
+      "renderer/**",
+      "assets/**",
+      "package.json",
+      "LICENSE",
+      "!assets/icon-1024.png",
+      "!**/*.map"
+    ],
+    "asarUnpack": [
+      "main/tools/*.ps1"
+    ],
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Vesper",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icon-1024.png",
+      "identity": null,
+      "hardenedRuntime": false
+    },
+    "dmg": {
+      "title": "Vesper ${version}"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Development",
+      "icon": "assets/icon-1024.png",
+      "maintainer": "SummusStuprator",
+      "synopsis": "Desktop coding agent"
+    },
+    "publish": {
+      "provider": "github",
+      "releaseType": "draft"
+    }
   }
 }

@@ -223,6 +223,7 @@ export function modeLadder(cur, onPick) {
 
 export function modelTags(m) {
   const tags = [];
+  if (m.abliterated) tags.push(h('span', { class: 'tag red' }, 'abliterated'));
   if (m.contextLength) tags.push(h('span', { class: 'tag' }, `${fmtTok(m.contextLength)} ctx`));
   if (m.vision) tags.push(h('span', { class: 'tag' }, icon('image', 'sm'), 'vision'));
   if (m.reasoningEfforts && m.reasoningEfforts.length) tags.push(h('span', { class: 'tag' }, 'reasoning'));

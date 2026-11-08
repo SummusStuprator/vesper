@@ -1,5 +1,5 @@
 // Vesper renderer: boot, workspace UI, transcript, composer, status bar, inspector, palette.
-import { h, $, api, icon, vesperMark, rlLogo, md, hl, langOf, toast, popover, closePop, lightbox, fmtUsd, fmtTok, fmtMs, fmtPrice, shortPath, relTime, modelTags, MODES, modeLabel } from './lib.js';
+import { h, $, api, icon, vesperMark, md, hl, langOf, toast, popover, closePop, lightbox, fmtUsd, fmtTok, fmtMs, fmtPrice, shortPath, relTime, modelTags, MODES, modeLabel } from './lib.js';
 import { mountSetup } from './setup.js';
 import { openSettings } from './settings.js';
 
@@ -7,7 +7,9 @@ const root = document.getElementById('app');
 const S = {
   cfg: null, catalogs: [], sessions: [], cur: null, busy: false, phase: '',
   sidebar: true, inspector: localStorage.getItem('vesper.inspector') !== '0',
-  attachments: [], credits: null, search: '', queue: [], lastTps: null,
+  attachments: [], credits: null, search: '', lastTps: null,
+  queues: new Map(),          // sessionId -> [{ qid, text, images, state: 'queued' | 'now' }]
+  openWork: new Set(),        // turn ids whose work block the user expanded
   approvals: new Map(),       // sessionId -> Map(itemId -> event)  (approvals and questions)
   live: new Map(),            // sessionId -> { busy, phase }
 };
@@ -43,7 +45,7 @@ async function startApp() {
   S.cfg = await api.config.get();
   applyTheme();
   root.replaceChildren(layout());
-  await Promise.all([refreshSessions(), refreshCatalogs()]);
+  await Promise.all([refreshSessions(), refreshCatalogs(), restorePending()]);
   if (S.sessions[0]) await openSession(S.sessions[0].id);
   else await newSession(S.cfg.recentWorkspaces[0]);
   refreshCredits();
@@ -56,8 +58,29 @@ async function refreshCatalogs(force) {
 }
 async function refreshCredits() {
   try { S.credits = await api.credits(); } catch { S.credits = null; }
+  // Warn once per launch when the balance gets low, before a run fails on insufficient credits.
+  if (S.credits && S.credits.available < 0.5 && !S.lowWarned) {
+    S.lowWarned = true;
+    toast(`Credit balance is low (${fmtUsd(S.credits.available, 2)}). Top up from the title bar.`, 'err');
+  }
   renderTitleRight(); renderInspector(); renderStatus();
 }
+// After a reload, rebuild which sessions are running and the approvals/questions they are waiting on.
+async function restorePending() {
+  try {
+    const p = await api.agent.pending();
+    for (const id of p.running) S.live.set(id, { busy: true, phase: 'working' });
+    for (const ev of p.events) registerPending(ev);
+  } catch {}
+}
+function registerPending(ev) {
+  const itemId = ev.kind === 'question' ? ev.itemId : ev.item.id;
+  if (!S.approvals.has(ev.sessionId)) S.approvals.set(ev.sessionId, new Map());
+  S.approvals.get(ev.sessionId).set(itemId, ev);
+  S.live.set(ev.sessionId, { busy: true, phase: ev.kind === 'question' ? 'waiting for your answer' : 'waiting for your approval' });
+  return itemId;
+}
+
 async function refreshSessions() { S.sessions = await api.sessions.list(); renderSessionList(); }
 
 function currentProvider() { return S.cfg.providers.find((p) => p.id === ((S.cur && S.cur.providerId) || S.cfg.activeProviderId)) || S.cfg.providers[0]; }
@@ -111,10 +134,11 @@ function renderTitleRight() {
   const c = S.credits;
   const low = c && c.available < 1;
   els.titleRight.replaceChildren(
-    hasRefuseless() || true ? h('div', { class: 'rl-pill', title: 'Refuseless account' },
-      h('button', { class: 'row', style: { border: 'none', background: 'none', padding: 0, gap: '8px' }, onclick: () => openSettings(ctx(), 'refuseless') }, rlLogo(17),
-        c ? h('span', { class: `bal ${low ? 'low' : ''}` }, fmtUsd(c.available, 2)) : null),
-      h('button', { class: 'top', title: 'Add credits on refuseless.com', onclick: () => api.open(S.cfg.referral) }, c ? 'TOP UP' : 'GET KEY')) : null,
+    hasRefuseless() ? h('div', { class: 'rl-pill', title: 'Credit balance' },
+      h('button', { class: 'row', style: { border: 'none', background: 'none', padding: 0, gap: '7px' }, onclick: () => openSettings(ctx(), 'refuseless') }, icon('coins', 'sm'),
+        h('span', { class: `bal ${low ? 'low' : ''}` }, c ? fmtUsd(c.available, 2) : '—')),
+      h('button', { class: 'top', title: 'Add credits', onclick: () => api.open(S.cfg.referral) }, 'TOP UP'))
+      : h('button', { class: 'btn sm', title: 'Add a hosted provider key', onclick: () => openSettings(ctx(), 'refuseless') }, icon('key', 'sm'), 'Get credits'),
     h('div', { class: 'tb-sep', style: { margin: '0 6px' } }),
     h('button', { class: 'icon-btn', title: `Command palette (${MOD}K)`, onclick: openPalette }, icon('search')),
     h('button', { class: 'icon-btn', title: 'Toggle light / dark', onclick: toggleTheme }, icon('moon')),
@@ -174,7 +198,9 @@ async function deleteSession(s) {
 
 // ───────────────────────────────────────────── sessions
 async function newSession(ws, opts) {
-  const s = await api.sessions.create(ws || (S.cur && S.cur.workspace) || S.cfg.recentWorkspaces[0], opts);
+  let s;
+  try { s = await api.sessions.create(ws || (S.cur && S.cur.workspace) || S.cfg.recentWorkspaces[0], opts); }
+  catch (e) { toast(`${e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')}. Using your home folder.`, 'err'); s = await api.sessions.create(null, opts); }
   await refreshSessions();
   await openSession(s.id);
   els.ta && els.ta.focus();
@@ -187,9 +213,13 @@ async function openSession(id) {
   S.busy = !!(S.cur.running || (live && live.busy));
   S.phase = live ? live.phase : '';
   S.attachments = [];
-  S.queue = [];
   renderAll();
   S.stick = true; scrollBottom(true);
+  focusComposer();
+}
+function focusComposer() {
+  const a = document.activeElement;
+  if (els.ta && (!a || a === document.body || a.closest('.composer'))) els.ta.focus();
 }
 
 async function changeWorkspace() {
@@ -211,18 +241,133 @@ function renderCrumb() {
 
 // ───────────────────────────────────────────── transcript
 const nodes = new Map();
+let groups = [];                 // turn groups of the open session, in order
+
+// A turn = a message you sent while the agent was idle + everything the agent did for it.
+// Its work (thinking, tool calls, intermediate replies, messages you sent mid-run) folds into one
+// collapsible block; the final answer stays outside so it stands out.
+const startsTurn = (it) => (it.type === 'user' && !it.interjected) || (it.type === 'compaction' && it.reason === 'manual');
+
+function groupTranscript(items) {
+  const out = [];
+  let g = null;
+  for (const it of items) {
+    if (!g || startsTurn(it)) {
+      g = { id: it.id, lead: startsTurn(it) ? it : null, items: [] };
+      out.push(g);
+      if (g.lead) continue;
+    }
+    g.items.push(it);
+  }
+  return out;
+}
+
+function splitGroup(g, live) {
+  if (live) return { work: g.items, answer: [] };
+  let last = -1;
+  g.items.forEach((it, i) => { if (it.type === 'tool' || (it.type === 'user' && it.interjected) || it.type === 'compaction') last = i; });
+  const work = g.items.slice(0, last + 1);
+  const answer = [];
+  for (const it of g.items.slice(last + 1)) {
+    if (it.type === 'assistant' || it.type === 'notice' || it.type === 'error') answer.push(it); else work.push(it);
+  }
+  // Only the last reply is "the answer"; earlier replies in the same stretch are part of the work.
+  const finals = answer.filter((x) => x.type === 'assistant');
+  if (finals.length > 1) for (const x of finals.slice(0, -1)) { answer.splice(answer.indexOf(x), 1); work.push(x); }
+  return { work, answer };
+}
+
+const isLive = (g) => S.busy && groups[groups.length - 1] === g;
+
+function workSummary(g, live) {
+  const its = g.items;
+  const tools = its.filter((x) => x.type === 'tool' && x.name !== 'todo_write');
+  const edits = its.filter((x) => x.type === 'tool' && x.display && x.display.diff).length;
+  const notes = its.filter((x) => x.type === 'user' && x.interjected).length;
+  const failed = tools.filter((x) => x.status === 'error').length;
+  const start = g.lead ? g.lead.ts : (its[0] && its[0].ts);
+  const end = live ? Date.now() : Math.max(start || 0, ...its.map((x) => x.ts || 0));
+  const dur = start ? fmtDuration(end - start) : '';
+  const bits = [
+    tools.length ? `${tools.length} tool call${tools.length === 1 ? '' : 's'}` : null,
+    edits ? `${edits} edit${edits === 1 ? '' : 's'}` : null,
+    notes ? `${notes} message${notes === 1 ? '' : 's'} from you` : null,
+    failed ? `${failed} failed` : null,
+  ].filter(Boolean);
+  return { title: live ? `Working${dur ? ` · ${dur}` : ''}` : `Worked${dur ? ` for ${dur}` : ''}`, bits };
+}
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${String(s % 60).padStart(2, '0')}s` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+function renderWorkHead(g) {
+  if (!g.headEl) return;
+  const live = isLive(g);
+  const { title, bits } = workSummary(g, live);
+  const open = g.workEl && g.workEl.classList.contains('open');
+  g.headEl.replaceChildren(
+    live ? h('span', { class: 'spinner' }) : icon('chev', 'sm chev'),
+    h('b', null, title),
+    bits.length ? h('span', { class: 'bits' }, bits.join(' · ')) : null,
+    h('span', { class: 'grow' }),
+    live ? null : h('span', { class: 'hint' }, open ? 'hide' : 'show'));
+}
+
+function renderGroup(g) {
+  const live = isLive(g);
+  const el = h('div', { class: 'turn' });
+  if (g.lead) { const n = renderItem(g.lead); if (n) { nodes.set(g.lead.id, n); el.append(n); } }
+  const { work, answer } = splitGroup(g, live);
+  g.bodyEl = h('div', { class: 'work-body' });
+  for (const it of work) { const n = renderItem(it); if (n) { nodes.set(it.id, n); g.bodyEl.append(n); } }
+  g.workEl = null; g.headEl = null;
+  if (work.length) {
+    const pend = S.approvals.get(S.cur.id);
+    const needsYou = pend && work.some((x) => pend.has(x.id));
+    const open = live || needsYou || S.openWork.has(g.id);
+    g.headEl = h('button', { class: 'work-head', onclick: () => {
+      if (isLive(g)) return;
+      const nowOpen = !g.workEl.classList.contains('open');
+      g.workEl.classList.toggle('open', nowOpen);
+      if (nowOpen) S.openWork.add(g.id); else S.openWork.delete(g.id);
+      renderWorkHead(g);
+    } });
+    g.workEl = h('div', { class: `work ${open ? 'open' : ''} ${live ? 'live' : ''}` }, g.headEl, g.bodyEl);
+    el.append(g.workEl);
+    renderWorkHead(g);
+  }
+  g.answerEl = h('div', { class: 'answer' });
+  for (const it of answer) { const n = renderItem(it); if (n) { nodes.set(it.id, n); g.answerEl.append(n); } }
+  el.append(g.answerEl);
+  if (g.el && g.el.isConnected) g.el.replaceWith(el);
+  g.el = el;
+  return el;
+}
+
+function rerenderGroup(g) {
+  if (!g || !S.cur) return;
+  renderGroup(g);
+  const pend = S.approvals.get(S.cur.id);
+  if (pend) for (const [itemId, a] of pend) if (g.items.some((x) => x.id === itemId)) attachPending(itemId, a);
+}
 
 function renderTranscript() {
   nodes.clear();
   const t = els.transcript;
-  if (!S.cur || !S.cur.transcript.length) { t.replaceChildren(emptyState()); return; }
+  if (!S.cur || !S.cur.transcript.length) { groups = []; t.replaceChildren(emptyState()); return; }
+  groups = groupTranscript(S.cur.transcript);
   const frag = document.createDocumentFragment();
-  for (const it of S.cur.transcript) { const n = renderItem(it); if (n) { nodes.set(it.id, n); frag.append(n); } }
+  for (const g of groups) frag.append(renderGroup(g));
   frag.append(els.working = workingRow());
   t.replaceChildren(frag);
   const pend = S.approvals.get(S.cur.id);
   if (pend) for (const [itemId, a] of pend) attachPending(itemId, a);
 }
+// Keep the live work header's clock ticking.
+setInterval(() => { const g = groups[groups.length - 1]; if (g && isLive(g)) renderWorkHead(g); }, 1000);
 
 function emptyState() {
   const ws = S.cur ? shortPath(S.cur.workspace) : '';
@@ -242,6 +387,7 @@ function emptyState() {
 
 function workingRow() { return h('div', { class: `working ${S.busy ? '' : 'hidden'}` }, h('span', { class: 'pulse-dot' }), h('span', { class: 'phase' }, S.phase || 'working')); }
 function updateWorking() {
+  renderQueue();
   if (els.working && els.working.isConnected) {
     els.working.classList.toggle('hidden', !S.busy);
     els.working.querySelector('.phase').textContent = `${S.phase || 'working'}…`;
@@ -264,6 +410,10 @@ function renderItem(it) {
 }
 
 function renderUser(it) {
+  if (it.interjected) {
+    return h('div', { class: 'msg-user mid' }, h('span', { class: 'label' }, 'you, mid-run'), h('div', null, it.text),
+      it.images && it.images.length ? h('div', { class: 'imgs' }, it.images.map((src) => h('img', { src, onclick: () => lightbox(src) }))) : null);
+  }
   const turnEdits = S.cur.transcript.filter((x) => x.type === 'tool' && x.turn === it.id && x.revertable && !x.reverted).length;
   return h('div', { class: 'msg-user' }, it.text,
     it.images && it.images.length ? h('div', { class: 'imgs' }, it.images.map((src) => h('img', { src, onclick: () => lightbox(src) }))) : null,
@@ -336,7 +486,7 @@ function renderTool(it) {
   if (it.name === 'task' && it.children && it.children.length) {
     wrap.append(h('div', { class: 'children' }, it.children.slice(-12).map((c) => h('div', { class: 'child' },
       h('span', { class: `dot ${c.status === 'done' ? 'ok' : c.status === 'error' ? 'err' : c.status === 'running' ? 'run' : ''}` }),
-      h('span', null, (TOOL_META[c.name] || [0, c.name])[1]), h('span', { class: 'arg' }, c.summary || '')))));
+      h('span', null, (TOOL_META[c.name] || [0, c.name])[1]), h('span', { class: 'arg' }, relSummary(c.summary || ''))))));
   }
   const autoOpen = (it.name === 'shell' && it.status === 'running') || (['edit_file', 'write_file', 'multi_edit'].includes(it.name) && d.diff);
   if (it._open ?? autoOpen) { wrap.classList.add('open'); wrap.append(toolBody(it)); }
@@ -410,11 +560,21 @@ function replaceNode(it) {
 
 function appendItem(it) {
   if (!S.cur.transcript.includes(it)) S.cur.transcript.push(it);
-  if (els.transcript.querySelector('.empty')) { renderTranscript(); return; }
-  const n = renderItem(it);
-  if (!n) return;
-  nodes.set(it.id, n);
-  els.working && els.working.isConnected ? els.working.before(n) : els.transcript.append(n);
+  if (els.transcript.querySelector('.empty') || !groups.length) { renderTranscript(); return; }
+  const place = (node) => (els.working && els.working.isConnected ? els.working.before(node) : els.transcript.append(node));
+  if (startsTurn(it)) {
+    const g = { id: it.id, lead: it, items: [] };
+    groups.push(g);
+    place(renderGroup(g));
+  } else {
+    const g = groups[groups.length - 1];
+    g.items.push(it);
+    if (!isLive(g) || !g.workEl) rerenderGroup(g);
+    else {
+      const n = renderItem(it);
+      if (n) { nodes.set(it.id, n); g.bodyEl.append(n); renderWorkHead(g); }
+    }
+  }
   // A tool on a user's turn makes that turn revertable: refresh the user bubble's actions.
   if (it.type === 'tool' && it.turn) { const u = S.cur.transcript.find((x) => x.id === it.turn); if (u) setTimeout(() => replaceNode(u), 0); }
 }
@@ -472,11 +632,20 @@ function queueRender(it) {
   renderQ.add(it);
   if (rafPending) return;
   rafPending = true;
-  setTimeout(() => { rafPending = false; for (const x of renderQ) replaceNode(x); renderQ.clear(); scrollBottom(); }, 50);
+  // Pace re-renders by message size so very long streamed answers don't pin the UI thread.
+  const size = Math.max(0, ...[...renderQ].map((x) => (x.text || '').length + (x.reasoning || '').length));
+  setTimeout(() => {
+    rafPending = false;
+    for (const x of renderQ) replaceNode(x);
+    renderQ.clear();
+    const g = groups[groups.length - 1]; if (g && isLive(g)) renderWorkHead(g);
+    scrollBottom();
+  }, Math.min(400, 50 + size / 80));
 }
 
 api.on.agent((ev) => {
   const sid = ev.sessionId;
+  if (ev.kind === 'inbox') return;
   if (ev.kind === 'status') {
     S.live.set(sid, { busy: ev.busy, phase: ev.phase || '' });
     if (S.cur && S.cur.id === sid) { S.busy = ev.busy; S.phase = ev.phase || ''; updateWorking(); renderSendBtn(); }
@@ -484,11 +653,8 @@ api.on.agent((ev) => {
     return;
   }
   if (ev.kind === 'approval' || ev.kind === 'question') {
-    const itemId = ev.kind === 'question' ? ev.itemId : ev.item.id;
-    if (!S.approvals.has(sid)) S.approvals.set(sid, new Map());
-    S.approvals.get(sid).set(itemId, ev);
-    const phase = ev.kind === 'question' ? 'waiting for your answer' : 'waiting for your approval';
-    S.live.set(sid, { busy: true, phase });
+    const itemId = registerPending(ev);
+    const phase = S.live.get(sid).phase;
     if (S.cur && S.cur.id === sid) { S.phase = phase; updateWorking(); attachPending(itemId, ev); }
     else toast('A session is waiting for you');
     renderSessionList();
@@ -497,12 +663,18 @@ api.on.agent((ev) => {
   if (ev.kind === 'done') {
     S.live.set(sid, { busy: false, phase: '' });
     if (S.approvals.get(sid)) S.approvals.get(sid).clear();
+    const q = queueOf(sid);
+    for (const x of q) if (x.state === 'now') x.state = 'queued';   // not delivered before the run ended
     if (S.cur && S.cur.id === sid) {
       S.busy = false; S.phase = ''; updateWorking(); renderSendBtn();
       if (ev.usage) S.cur.usage = ev.usage;
       if (ev.contextMessages != null) S.cur.contextMessages = ev.contextMessages;
-      renderInspector(); renderStatus();
-      if (S.queue.length) { const next = S.queue.shift(); renderQueue(); setTimeout(() => send(next.text, next.images), 200); }
+      rerenderGroup(groups[groups.length - 1]);
+      renderInspector(); renderStatus(); renderQueue();
+    }
+    if (q.length) {
+      if (ev.stopped || ev.failed) { if (S.cur && S.cur.id === sid) toast(`${q.length} queued message${q.length === 1 ? '' : 's'} kept. Press Send to deliver.`); }
+      else setTimeout(() => drainQueue(sid), 350);
     }
     refreshSessions(); refreshCredits();
     return;
@@ -511,9 +683,15 @@ api.on.agent((ev) => {
   const items = S.cur.transcript;
   const find = (id) => items.find((x) => x.id === id);
   switch (ev.kind) {
-    case 'item:add': appendItem(ev.item); scrollBottom(); break;
+    case 'item:add':
+      if (ev.item.qid) { const q = queueOf(sid); const k = q.findIndex((x) => x.qid === ev.item.qid); if (k >= 0) { q.splice(k, 1); renderQueue(); } }
+      appendItem(ev.item); scrollBottom(); break;
     case 'item:update': { const it = find(ev.id); if (it) { Object.assign(it, ev.patch); if (ev.patch.tps) S.lastTps = ev.patch.tps; queueRender(it); } break; }
-    case 'item:remove': { const i = items.findIndex((x) => x.id === ev.id); if (i >= 0) items.splice(i, 1); const n = nodes.get(ev.id); n && n.remove(); nodes.delete(ev.id); break; }
+    case 'item:remove': {
+      const i = items.findIndex((x) => x.id === ev.id); if (i >= 0) items.splice(i, 1);
+      for (const g of groups) { const j = g.items.findIndex((x) => x.id === ev.id); if (j >= 0) g.items.splice(j, 1); }
+      const n = nodes.get(ev.id); n && n.remove(); nodes.delete(ev.id); break;
+    }
     case 'text': { const it = find(ev.id); if (it) { it.text = (it.text || '') + ev.delta; queueRender(it); } break; }
     case 'reasoning': { const it = find(ev.id); if (it) { it.reasoning = (it.reasoning || '') + ev.delta; queueRender(it); } break; }
     case 'tool:progress': {
@@ -562,12 +740,22 @@ function composer() {
   ta.addEventListener('keydown', (e) => {
     if (els.slash && ['ArrowDown', 'ArrowUp', 'Tab'].includes(e.key)) { e.preventDefault(); moveSlash(e.key === 'ArrowUp' ? -1 : 1); return; }
     if (e.key === 'Tab' && e.shiftKey) { e.preventDefault(); cycleMode(); return; }
+    if (e.key === 'ArrowUp' && !ta.value && S.cur) {
+      const q = queueOf(S.cur.id).filter((x) => x.state !== 'now');
+      const last = q[q.length - 1];
+      if (last) { e.preventDefault(); removeQueued(last); ta.value = last.text; autosize(ta); renderSendBtn(); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       if (els.slash && els.slashSel != null) { pickSlash(els.slashItems[els.slashSel][0]); return; }
       submit();
     }
     if (e.key === 'Escape' && S.busy) stop();
+  });
+  els.box.addEventListener('mousedown', (e) => {
+    // Clicking anywhere in the composer (padding, bar background) puts the caret in the text box.
+    if (e.target === ta || e.target.closest('button, input, select, .pop, .att')) return;
+    e.preventDefault(); ta.focus();
   });
   ta.addEventListener('paste', (e) => { const files = [...((e.clipboardData && e.clipboardData.files) || [])]; if (files.length) { e.preventDefault(); addFiles(files); } });
   els.box.addEventListener('dragover', (e) => { e.preventDefault(); els.box.classList.add('drag'); });
@@ -584,7 +772,7 @@ function renderSendBtn() {
   const stopMode = S.busy && empty;
   els.send.classList.toggle('stop', stopMode);
   els.send.replaceChildren(icon(stopMode ? 'stop' : 'arrowUp'));
-  els.send.title = stopMode ? 'Stop (Esc)' : S.busy ? 'Queue message (Enter)' : 'Send (Enter)';
+  els.send.title = stopMode ? 'Stop (Esc)' : S.busy ? 'Queue: sent when Vesper finishes (Enter)' : 'Send (Enter)';
   els.send.disabled = !S.busy && empty;
 }
 
@@ -624,7 +812,7 @@ function renderStatus() {
     S.cur.incognito ? h('div', { class: 'seg-s' }, icon('eye', 'sm'), 'incognito') : null,
     h('div', { class: 'grow' }),
     h('button', { class: 'seg-s right', title: 'Model', onclick: (e) => modelMenu(e.currentTarget) }, m.id || ''),
-    S.credits ? h('button', { class: 'seg-s right', title: 'Refuseless balance · top up', onclick: () => api.open(S.cfg.referral) }, '∞', fmtUsd(S.credits.available, 2)) : null);
+    S.credits ? h('button', { class: `seg-s right ${S.credits.available < 1 ? 'warn' : ''}`, title: 'Credit balance · click to top up', onclick: () => api.open(S.cfg.referral) }, icon('coins', 'sm'), fmtUsd(S.credits.available, 2)) : null);
 }
 
 function modelMenu(anchor) {
@@ -639,8 +827,10 @@ function modelMenu(anchor) {
         S.cfg = await api.config.get(); closePop(); renderComposerBar(); renderInspector(); renderStatus();
       } },
       h('span', { class: 'check' }, on ? icon('check', 'sm') : null),
-      h('div', { class: 'grow' }, h('div', { class: 'mono', style: { fontSize: '12.5px', fontWeight: 600 } }, m.id), h('div', { class: 'tags' }, modelTags(m), m.abliterated ? h('span', { class: 'tag red' }, 'abliterated') : null)),
-      h('span', { class: 'r' }, m.pricing ? fmtPrice(m.pricing) : '')));
+      h('div', { class: 'grow' }, h('div', { class: 'mono', style: { fontSize: '12.5px', fontWeight: 600 } }, m.id),
+        m.blurb ? h('div', { class: 'd', style: { margin: '2px 0 3px' } }, m.blurb) : null,
+        h('div', { class: 'tags' }, modelTags(m))),
+      h('span', { class: 'r' }, m.pricing ? `${fmtPrice(m.pricing)}${m.priceEstimate ? ' (est.)' : ''}` : '')));
     }
   }
   if (cur.reasoningEfforts && cur.reasoningEfforts.length) {
@@ -739,10 +929,61 @@ function renderAttachments() {
     h('span', null, a.name.length > 24 ? a.name.slice(0, 22) + '…' : a.name),
     h('button', { class: 'x', onclick: () => { S.attachments.splice(i, 1); renderAttachments(); renderSendBtn(); } }, '×'))));
 }
+// ── message queue: messages sent while the agent works wait here (FIFO) and go out when it finishes.
+// "Send now" delivers one to the running agent at its next step instead.
+function queueOf(sid) { if (!S.queues.has(sid)) S.queues.set(sid, []); return S.queues.get(sid); }
+const newQid = () => Math.random().toString(36).slice(2, 10);
+
 function renderQueue() {
-  if (!els.queueEl) return;
-  els.queueEl.replaceChildren(...S.queue.map((q, i) => h('div', { class: 'qi' }, h('span', { class: 'label' }, `queued ${i + 1}`), h('span', { class: 't' }, q.text),
-    h('button', { class: 'icon-btn', title: 'Remove', onclick: () => { S.queue.splice(i, 1); renderQueue(); } }, icon('x', 'sm')))));
+  if (!els.queueEl || !S.cur) return;
+  const q = queueOf(S.cur.id);
+  if (!q.length) { els.queueEl.replaceChildren(); return; }
+  els.queueEl.replaceChildren(
+    h('div', { class: 'q-head' }, h('span', { class: 'label' }, S.busy ? 'Queued · sent when Vesper finishes' : 'Queued'), h('span', { class: 'grow' }),
+      q.length > 1 ? h('button', { class: 'link', onclick: () => { q.length = 0; renderQueue(); } }, 'Clear all') : null),
+    ...q.map((item) => {
+      const text = h('span', { class: 't', title: 'Click to edit', onclick: () => editQueued(item, text) }, item.text || '(image)');
+      return h('div', { class: `qi ${item.state === 'now' ? 'now' : ''}` },
+        text,
+        item.images && item.images.length ? h('span', { class: 'tag' }, `+${item.images.length} image${item.images.length === 1 ? '' : 's'}`) : null,
+        item.state === 'now' ? h('span', { class: 'tag red' }, 'at next step')
+          : h('button', { class: 'btn sm now-btn', title: S.busy ? 'Deliver to the running agent after its current step' : 'Send this now', onclick: () => sendNow(item) }, icon('arrowUp', 'sm'), S.busy ? 'Send now' : 'Send'),
+        h('button', { class: 'icon-btn', title: 'Move back into the composer', onclick: () => {
+          removeQueued(item);
+          els.ta.value = els.ta.value.trim() ? `${item.text}\n\n${els.ta.value}` : item.text;
+          if (item.images && item.images.length) { S.attachments.push(...item.images.map((image, i) => ({ name: `image ${i + 1}`, image }))); renderAttachments(); }
+          autosize(els.ta); els.ta.focus(); renderSendBtn();
+        } }, icon('edit', 'sm')),
+        h('button', { class: 'icon-btn', title: 'Remove', onclick: () => removeQueued(item) }, icon('x', 'sm')));
+    }));
+}
+function removeQueued(item) { const q = queueOf(S.cur.id); const i = q.indexOf(item); if (i >= 0) q.splice(i, 1); renderQueue(); }
+function editQueued(item, span) {
+  if (item.state === 'now') return toast('Already on its way to the agent');
+  const ta = h('textarea', { class: 'q-edit', value: item.text, rows: Math.min(8, item.text.split('\n').length + 1) });
+  let closed = false;
+  const done = (save) => { if (closed) return; closed = true; if (save) item.text = ta.value.trim() || item.text; renderQueue(); };
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); done(true); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(false); }
+  });
+  ta.addEventListener('blur', () => done(true));
+  span.replaceWith(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+async function sendNow(item) {
+  const sid = S.cur.id;
+  if (!S.busy) { removeQueued(item); return send(item.text, item.images); }
+  const ok = await api.agent.interject({ sessionId: sid, text: item.text, images: item.images, qid: item.qid }).catch(() => false);
+  if (ok) { item.state = 'now'; toast('Delivered at the agent\'s next step'); }
+  else toast('The run is wrapping up; it goes out right after');
+  renderQueue();
+}
+function drainQueue(sid) {
+  const q = queueOf(sid);
+  if (!q.length || (S.live.get(sid) || {}).busy) return;
+  const next = q.shift();
+  if (S.cur && S.cur.id === sid) { renderQueue(); send(next.text, next.images); }
+  else api.agent.send({ sessionId: sid, text: next.text, images: next.images }).catch((e) => { q.unshift(next); toast(e.message, 'err'); });
 }
 
 // ── send / stop
@@ -760,7 +1001,7 @@ async function submit() {
   }
   els.ta.value = ''; autosize(els.ta);
   S.attachments = []; renderAttachments();
-  if (S.busy) { S.queue.push({ text, images }); renderQueue(); renderSendBtn(); toast('Queued — sends when the current run finishes'); return; }
+  if (S.busy) { queueOf(S.cur.id).push({ qid: newQid(), text, images, state: 'queued' }); renderQueue(); renderSendBtn(); return; }
   await send(text, images);
 }
 
@@ -768,11 +1009,19 @@ async function send(text, images) {
   S.busy = true; S.phase = 'thinking'; updateWorking(); renderSendBtn();
   S.stick = true;
   try { await api.agent.send({ sessionId: S.cur.id, text, images }); }
-  catch (e) { S.busy = false; updateWorking(); renderSendBtn(); toast(e.message, 'err'); }
+  catch (e) {
+    if (/already running/i.test(e.message)) {
+      // The UI thought the session was idle but it is still working: never lose the message.
+      queueOf(S.cur.id).push({ qid: newQid(), text, images, state: 'queued' }); renderQueue();
+      toast('Still working. Your message is queued (Send now delivers it at the next step).');
+      return;
+    }
+    S.busy = false; updateWorking(); renderSendBtn(); toast(e.message, 'err');
+  }
   if (!els.working || !els.working.isConnected) { els.working = workingRow(); els.transcript.append(els.working); }
   updateWorking();
 }
-function stop() { if (S.cur) { S.queue = []; renderQueue(); api.agent.stop(S.cur.id); } }
+function stop() { if (S.cur) api.agent.stop(S.cur.id); }
 function retryLast() { send('Please continue — the previous request failed. Pick up where you left off.', []); }
 
 // ───────────────────────────────────────────── inspector
@@ -808,13 +1057,13 @@ function renderInspector() {
       h('div', { class: 'kv' }, h('span', null, 'Output'), h('span', null, fmtTok(u.output || 0))),
       h('div', { class: 'kv' }, h('span', null, 'Requests'), h('span', null, u.requests || 0))),
     h('section', { class: 'ins-sec' },
-      h('h4', null, h('span', { class: 'label' }, 'Refuseless'), h('button', { class: 'btn sm rl', onclick: () => api.open(S.cfg.referral) }, 'Top up')),
+      h('h4', null, h('span', { class: 'label' }, 'Credits'), h('button', { class: 'btn sm rl', onclick: () => api.open(S.cfg.referral) }, 'Top up')),
       S.credits ? h('frag', null,
         h('div', { class: 'big-num' }, fmtUsd(S.credits.available, 2), h('small', null, 'available')),
         h('div', { style: { height: '8px' } }),
         h('div', { class: 'kv' }, h('span', null, 'Held by running requests'), h('span', null, fmtUsd(S.credits.reserved || 0, 2))),
         S.credits.key_limit != null ? h('div', { class: 'kv' }, h('span', null, 'Key budget left'), h('span', null, fmtUsd(S.credits.key_limit, 2))) : null)
-        : h('div', { class: 'faint', style: { fontSize: '12.5px' } }, hasRefuseless() ? 'Balance unavailable right now.' : 'Add a Refuseless key in Settings to see your balance here.')),
+        : h('div', { class: 'faint', style: { fontSize: '12.5px' } }, hasRefuseless() ? 'Balance unavailable right now.' : 'Connect a hosted account in Settings to see your balance here.')),
     h('section', { class: 'ins-sec' },
       h('h4', null, h('span', { class: 'label' }, 'Model'), m.abliterated ? h('span', { class: 'tag red' }, 'abliterated') : null),
       h('div', { class: 'mono', style: { fontSize: '12.5px', marginBottom: '8px', fontWeight: 600 } }, m.id || '—'),
@@ -855,9 +1104,9 @@ function openPalette() {
     ['Toggle light / dark', toggleTheme],
     ['Toggle sidebar', toggleSidebar, `${MOD}B`],
     ['Toggle inspector', toggleInspector, `${MOD}.`],
-    ['Top up Refuseless credits', () => api.open(S.cfg.referral)],
+    ['Top up credits', () => api.open(S.cfg.referral)],
     ['Settings: General', () => openSettings(ctx(), 'general'), `${MOD},`],
-    ['Settings: Refuseless', () => openSettings(ctx(), 'refuseless')],
+    ['Settings: Account & credits', () => openSettings(ctx(), 'refuseless')],
     ['Settings: Privacy & security', () => openSettings(ctx(), 'security')],
     ['Settings: Memory', () => openSettings(ctx(), 'memory')],
     ['Settings: Providers', () => openSettings(ctx(), 'providers')],
@@ -894,6 +1143,13 @@ function openPalette() {
 
 // ───────────────────────────────────────────── keyboard
 document.addEventListener('keydown', (e) => {
+  // Start typing anywhere and it lands in the composer.
+  const a = document.activeElement;
+  if (els.ta && S.cur && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && (!a || a === document.body || a === document.documentElement)
+    && !document.querySelector('.palette-wrap, .overlay')) els.ta.focus();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && S.busy && !e.defaultPrevented && !document.querySelector('.palette-wrap, .overlay, .pop') && document.activeElement !== els.ta) { stop(); return; }
   const mod = isMac ? e.metaKey : e.ctrlKey;
   if (!mod || !S.cur) return;
   const k = e.key.toLowerCase();
