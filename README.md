@@ -114,7 +114,7 @@ Vesper follows project instructions in `AGENTS.md`, `VESPER.md`, `CLAUDE.md` or 
 Requires Node.js 20+.
 
 ```bash
-git clone <this repository>
+git clone https://github.com/SummusStuprator/vesper.git
 cd vesper
 npm install
 npm start            # run the app (npm run dev opens DevTools)

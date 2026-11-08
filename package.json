@@ -121,5 +121,12 @@
       "maintainer": "SummusStuprator",
       "synopsis": "Desktop coding agent"
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SummusStuprator/vesper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SummusStuprator/vesper/issues"
   }
 }
